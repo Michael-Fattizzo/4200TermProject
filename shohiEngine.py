@@ -156,3 +156,219 @@ def piece_slide_dirs(piece: Piece) -> List[Tuple[int, int]]:
         return [(-1, 0), (1, 0), (0, -1), (0, 1)]
     return []
 
+
+def generate_pseudo_legal_moves(position: Position, side: str) -> List[Move]:
+    moves: List[Move] = []
+
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            piece = position.board[r][c]
+            if piece is None or piece.owner != side:
+                continue
+
+            src = (r, c)
+
+            for dr, dc in piece_step_moves(piece):
+                nr, nc = r + dr, c + dc
+                if not inside(nr, nc):
+                    continue
+                target = position.board[nr][nc]
+                if target and target.owner == side:
+                    continue
+
+                base_move = Move(
+                    from_sq=src,
+                    to_sq=(nr, nc),
+                    piece=piece.kind,
+                    side=side,
+                    captured=target.code() if target else None,
+                )
+
+                if can_promote(piece, src, (nr, nc)):
+                    if must_promote(piece, (nr, nc)):
+                        moves.append(Move(**{**base_move.__dict__, "promote": True}))
+                    else:
+                        moves.append(base_move)
+                        moves.append(Move(**{**base_move.__dict__, "promote": True}))
+                else:
+                    moves.append(base_move)
+
+            for dr, dc in piece_slide_dirs(piece):
+                nr, nc = r + dr, c + dc
+                while inside(nr, nc):
+                    target = position.board[nr][nc]
+                    if target and target.owner == side:
+                        break
+
+                    base_move = Move(
+                        from_sq=src,
+                        to_sq=(nr, nc),
+                        piece=piece.kind,
+                        side=side,
+                        captured=target.code() if target else None,
+                    )
+
+                    if can_promote(piece, src, (nr, nc)):
+                        if must_promote(piece, (nr, nc)):
+                            moves.append(Move(**{**base_move.__dict__, "promote": True}))
+                        else:
+                            moves.append(base_move)
+                            moves.append(Move(**{**base_move.__dict__, "promote": True}))
+                    else:
+                        moves.append(base_move)
+
+                    if target is not None:
+                        break
+                    nr += dr
+                    nc += dc
+
+    moves.extend(generate_drop_moves(position, side))
+    return moves
+
+
+def generate_drop_moves(position: Position, side: str) -> List[Move]:
+    moves: List[Move] = []
+    hand = position.hands[side]
+
+    for piece_kind, count in hand.items():
+        if count <= 0:
+            continue
+
+        for r in range(BOARD_SIZE):
+            for c in range(BOARD_SIZE):
+                if position.board[r][c] is not None:
+                    continue
+
+                if piece_kind == "P":
+                    if pawn_drop_illegal(position, side, (r, c)):
+                        continue
+                elif piece_kind == "L":
+                    if (side == BLACK and r == 0) or (side == WHITE and r == 8):
+                        continue
+                elif piece_kind == "N":
+                    if (side == BLACK and r <= 1) or (side == WHITE and r >= 7):
+                        continue
+
+                moves.append(
+                    Move(
+                        from_sq=None,
+                        to_sq=(r, c),
+                        piece=piece_kind,
+                        side=side,
+                        drop=True,
+                    )
+                )
+    return moves
+
+
+def pawn_drop_illegal(position: Position, side: str, dst: Tuple[int, int]) -> bool:
+    r, c = dst
+    if (side == BLACK and r == 0) or (side == WHITE and r == 8):
+        return True
+
+    for row in range(BOARD_SIZE):
+        p = position.board[row][c]
+        if p and p.owner == side and p.kind == "P" and not p.promoted:
+            return True
+
+    trial = apply_move(position, Move(from_sq=None, to_sq=dst, piece="P", side=side, drop=True))
+    if is_checkmate(trial, opponent(side)):
+        return True
+
+    return False
+
+
+def apply_move(position: Position, move: Move) -> Position:
+    new_pos = position.clone()
+    side = move.side
+
+    if move.drop:
+        if new_pos.hands[side][move.piece] <= 0:
+            raise ValueError(f"No {move.piece} in hand for {side}.")
+        new_pos.hands[side][move.piece] -= 1
+        new_pos.set_piece(move.to_sq, Piece(kind=move.piece, owner=side, promoted=False))
+    else:
+        moving_piece = new_pos.piece_at(move.from_sq)
+        if moving_piece is None:
+            raise ValueError("No piece on source square.")
+
+        target = new_pos.piece_at(move.to_sq)
+        if target is not None:
+            captured_base = target.kind
+            new_pos.hands[side][captured_base] += 1
+
+        new_pos.set_piece(move.from_sq, None)
+        new_piece = Piece(
+            kind=moving_piece.kind,
+            owner=side,
+            promoted=moving_piece.promoted or move.promote,
+        )
+        new_pos.set_piece(move.to_sq, new_piece)
+
+    new_pos.side_to_move = opponent(side)
+    return new_pos
+
+
+def attacked_by(position: Position, attacker_side: str, square: Tuple[int, int]) -> bool:
+    for move in generate_pseudo_legal_moves_no_drops(position, attacker_side):
+        if move.to_sq == square:
+            return True
+    return False
+
+
+def generate_pseudo_legal_moves_no_drops(position: Position, side: str) -> List[Move]:
+    moves: List[Move] = []
+
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            piece = position.board[r][c]
+            if piece is None or piece.owner != side:
+                continue
+
+            src = (r, c)
+
+            for dr, dc in piece_step_moves(piece):
+                nr, nc = r + dr, c + dc
+                if not inside(nr, nc):
+                    continue
+                target = position.board[nr][nc]
+                if target and target.owner == side:
+                    continue
+                moves.append(Move(from_sq=src, to_sq=(nr, nc), piece=piece.kind, side=side))
+
+            for dr, dc in piece_slide_dirs(piece):
+                nr, nc = r + dr, c + dc
+                while inside(nr, nc):
+                    target = position.board[nr][nc]
+                    if target and target.owner == side:
+                        break
+                    moves.append(Move(from_sq=src, to_sq=(nr, nc), piece=piece.kind, side=side))
+                    if target is not None:
+                        break
+                    nr += dr
+                    nc += dc
+
+    return moves
+
+
+def in_check(position: Position, side: str) -> bool:
+    king_sq = position.king_square(side)
+    if king_sq is None:
+        return True
+    return attacked_by(position, opponent(side), king_sq)
+
+
+def generate_legal_moves(position: Position, side: str) -> List[Move]:
+    legal: List[Move] = []
+    for move in generate_pseudo_legal_moves(position, side):
+        nxt = apply_move(position, move)
+        if not in_check(nxt, side):
+            legal.append(move)
+    return legal
+
+
+def is_checkmate(position: Position, side: str) -> bool:
+    if not in_check(position, side):
+        return False
+    return len(generate_legal_moves(position, side)) == 0
+
