@@ -3,12 +3,24 @@ from __future__ import annotations
 import glob
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import mss
 import numpy as np
+
+from shogi_engine import (
+    BLACK,
+    WHITE,
+    Move,
+    Position,
+    apply_move,
+    generate_legal_moves,
+    opponent,
+    parse_capture_label,
+    suggest_move_from_capture_state,
+)
 
 # Configuration
 
@@ -34,6 +46,18 @@ SAVE_DETECTION_DEBUG = True
 DETECTION_DEBUG_PREFIX = "detection_debug_monitor_"
 
 STARTUP_DELAY_SECONDS = 5
+
+# Agent / tracker configuration
+
+INITIAL_SIDE_TO_MOVE = BLACK
+LEFT_HAND_OWNER = WHITE
+RIGHT_HAND_OWNER = BLACK
+
+# A position must remain unchanged for this many consecutive frames
+# before it is treated as "stable" and eligible for move tracking.
+STABLE_FRAMES_REQUIRED = 3
+
+ENGINE_DEPTH = 2
 
 # Data classes
 
@@ -66,6 +90,29 @@ class Regions:
     board: Region
     left_hand: Region
     right_hand: Region
+
+
+@dataclass
+class TrackedMove:
+    ply: int
+    side: str
+    usi: str
+    explanation: str
+
+
+@dataclass
+class TrackerState:
+    previous_stable_capture_state: Optional[Dict[str, object]] = None
+    previous_stable_position: Optional[Position] = None
+    side_to_move: Optional[str] = INITIAL_SIDE_TO_MOVE
+
+    pending_signature: Optional[Tuple] = None
+    pending_count: int = 0
+    current_stable_signature: Optional[Tuple] = None
+
+    move_history: List[TrackedMove] = field(default_factory=list)
+    last_detected_move: Optional[TrackedMove] = None
+
 
 # Screen capture
 
@@ -708,6 +755,192 @@ def print_state(state: Dict[str, object]) -> None:
     for i, slot in enumerate(state["right_hand"], start=1):
         print(f"slot {i}: {slot}")
 
+
+def print_move_history(tracker: TrackerState, max_items: int = 12) -> None:
+    print("\n=== MOVE HISTORY ===")
+    if not tracker.move_history:
+        print("(none)")
+        return
+
+    for item in tracker.move_history[-max_items:]:
+        move_no = (item.ply + 1) // 2
+        mover = "B" if item.side == BLACK else "W"
+        print(f"{move_no:>3}.{mover} {item.usi}  {item.explanation}")
+
+# Turn detection + move tracking helpers
+
+def normalize_hand_piece_label(label: str) -> Optional[str]:
+    if label in {"", ".", "empty", "blank", "unknown"}:
+        return None
+    return label.replace("+", "").upper()
+
+
+def capture_state_to_position(
+    capture_state: Dict[str, object],
+    side_to_move: Optional[str],
+    left_hand_owner: str = LEFT_HAND_OWNER,
+    right_hand_owner: str = RIGHT_HAND_OWNER,
+) -> Position:
+    pos = Position(side_to_move=side_to_move or INITIAL_SIDE_TO_MOVE)
+
+    for r in range(9):
+        for c in range(9):
+            label = capture_state["board"][r][c]["label"]
+            try:
+                pos.board[r][c] = parse_capture_label(label)
+            except Exception:
+                pos.board[r][c] = None
+
+    for slot in capture_state.get("left_hand", []):
+        piece = normalize_hand_piece_label(str(slot.get("piece", ".")))
+        count = int(slot.get("count", 0))
+        if piece and count > 0:
+            pos.hands[left_hand_owner][piece] += count
+
+    for slot in capture_state.get("right_hand", []):
+        piece = normalize_hand_piece_label(str(slot.get("piece", ".")))
+        count = int(slot.get("count", 0))
+        if piece and count > 0:
+            pos.hands[right_hand_owner][piece] += count
+
+    return pos
+
+
+def piece_signature(piece: Optional[Any]) -> Optional[Tuple[str, str, bool]]:
+    if piece is None:
+        return None
+    return (piece.kind, piece.owner, piece.promoted)
+
+
+def position_signature(position: Position) -> Tuple:
+    board_sig = tuple(
+        tuple(piece_signature(position.board[r][c]) for c in range(9))
+        for r in range(9)
+    )
+    hand_sig = (
+        tuple(sorted(position.hands[BLACK].items())),
+        tuple(sorted(position.hands[WHITE].items())),
+    )
+    return board_sig + hand_sig
+
+
+def positions_equivalent(a: Position, b: Position) -> bool:
+    return position_signature(a) == position_signature(b)
+
+
+def move_to_explanation(move: Move) -> str:
+    if move.drop:
+        return f"drop {move.piece} to {move.usi().split('*', 1)[1]}"
+    if move.promote:
+        return f"{move.usi()} (promotion)"
+    return move.usi()
+
+
+def infer_transition_move(
+    prev_position: Position,
+    curr_position: Position,
+    expected_side_to_move: Optional[str],
+) -> Tuple[Optional[str], Optional[Move]]:
+    candidate_sides = [expected_side_to_move] if expected_side_to_move else [BLACK, WHITE]
+
+    for side in candidate_sides:
+        if side is None:
+            continue
+        trial_prev = prev_position.clone()
+        trial_prev.side_to_move = side
+
+        for move in generate_legal_moves(trial_prev, side):
+            try:
+                nxt = apply_move(trial_prev, move)
+            except Exception:
+                continue
+            if positions_equivalent(nxt, curr_position):
+                return side, move
+
+    if expected_side_to_move is None:
+        return None, None
+
+    other_side = opponent(expected_side_to_move)
+    trial_prev = prev_position.clone()
+    trial_prev.side_to_move = other_side
+    for move in generate_legal_moves(trial_prev, other_side):
+        try:
+            nxt = apply_move(trial_prev, move)
+        except Exception:
+            continue
+        if positions_equivalent(nxt, curr_position):
+            return other_side, move
+
+    return None, None
+
+
+def update_tracker_from_capture_state(
+    tracker: TrackerState,
+    capture_state: Dict[str, object],
+) -> bool:
+    current_position = capture_state_to_position(
+        capture_state=capture_state,
+        side_to_move=tracker.side_to_move,
+        left_hand_owner=LEFT_HAND_OWNER,
+        right_hand_owner=RIGHT_HAND_OWNER,
+    )
+    current_sig = position_signature(current_position)
+
+    if tracker.pending_signature == current_sig:
+        tracker.pending_count += 1
+    else:
+        tracker.pending_signature = current_sig
+        tracker.pending_count = 1
+
+    if tracker.pending_count < STABLE_FRAMES_REQUIRED:
+        return False
+
+    if tracker.current_stable_signature == current_sig:
+        return False
+
+    tracker.current_stable_signature = current_sig
+
+    if tracker.previous_stable_position is None:
+        tracker.previous_stable_position = current_position
+        tracker.previous_stable_capture_state = capture_state
+        tracker.last_detected_move = None
+        return True
+
+    moved_side, detected_move = infer_transition_move(
+        prev_position=tracker.previous_stable_position,
+        curr_position=current_position,
+        expected_side_to_move=tracker.side_to_move,
+    )
+
+    if detected_move is not None and moved_side is not None:
+        tracked = TrackedMove(
+            ply=len(tracker.move_history) + 1,
+            side=moved_side,
+            usi=detected_move.usi(),
+            explanation=move_to_explanation(detected_move),
+        )
+        tracker.move_history.append(tracked)
+        tracker.last_detected_move = tracked
+        tracker.side_to_move = opponent(moved_side)
+    else:
+        # Fallback: keep synchronization even when the exact move could not
+        # be reconstructed, but do not invent a move history entry.
+        tracker.last_detected_move = None
+        if tracker.side_to_move is None:
+            tracker.side_to_move = INITIAL_SIDE_TO_MOVE
+
+    tracker.previous_stable_position = current_position
+    tracker.previous_stable_capture_state = capture_state
+    return True
+
+
+def side_label(side: Optional[str]) -> str:
+    if side == BLACK:
+        return "BLACK"
+    if side == WHITE:
+        return "WHITE"
+    return "UNKNOWN"
+
 # Main app loop
 
 def main() -> None:
@@ -743,12 +976,34 @@ def main() -> None:
     print("right_hand=", regions.right_hand.as_dict())
     print("monitor   =", active_monitor)
 
+    print("\nTracker configuration:")
+    print("  INITIAL_SIDE_TO_MOVE =", side_label(INITIAL_SIDE_TO_MOVE))
+    print("  LEFT_HAND_OWNER      =", side_label(LEFT_HAND_OWNER))
+    print("  RIGHT_HAND_OWNER     =", side_label(RIGHT_HAND_OWNER))
+    print("  STABLE_FRAMES_REQUIRED =", STABLE_FRAMES_REQUIRED)
+
+    tracker = TrackerState(side_to_move=INITIAL_SIDE_TO_MOVE)
+
     last_print = 0.0
     print_interval = 1.0
 
     while True:
         screen = capture_monitor(active_monitor)
         state = extract_state(screen, regions, templates, digit_templates)
+        became_stable = update_tracker_from_capture_state(tracker, state)
+
+        suggestion = None
+        try:
+            suggestion = suggest_move_from_capture_state(
+                capture_state=state,
+                side_to_move=tracker.side_to_move or INITIAL_SIDE_TO_MOVE,
+                depth=ENGINE_DEPTH,
+                left_hand_owner=LEFT_HAND_OWNER,
+                right_hand_owner=RIGHT_HAND_OWNER,
+            )
+        except Exception as exc:
+            suggestion = None
+            print(f"Engine error: {exc}")
 
         overlay = draw_regions(screen, regions)
 
@@ -759,6 +1014,27 @@ def main() -> None:
         board_debug = draw_board_grid(board_img)
         left_hand_debug = draw_hand_slots(left_hand_img)
         right_hand_debug = draw_hand_slots(right_hand_img)
+
+        overlay_lines = [
+            f"Turn: {side_label(tracker.side_to_move)}",
+            f"Stable frames: {tracker.pending_count}/{STABLE_FRAMES_REQUIRED}",
+        ]
+        if tracker.last_detected_move is not None:
+            overlay_lines.append(f"Last move: {tracker.last_detected_move.usi}")
+        if suggestion:
+            overlay_lines.append(f"Best: {suggestion['move']}")
+
+        for idx, line in enumerate(overlay_lines):
+            cv2.putText(
+                overlay,
+                line,
+                (20, 35 + idx * 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
 
         if DEBUG_WINDOW_SCALE != 1.0:
             overlay = cv2.resize(
@@ -777,6 +1053,28 @@ def main() -> None:
         now = time.time()
         if now - last_print >= print_interval:
             print_state(state)
+
+            print("\n=== TURN TRACKER ===")
+            print("side_to_move:", side_label(tracker.side_to_move))
+            if tracker.last_detected_move is not None:
+                print("last_detected_move:", tracker.last_detected_move.usi)
+            else:
+                print("last_detected_move: none")
+
+            if became_stable:
+                print("position_status: new stable position accepted")
+            else:
+                print("position_status: waiting / unchanged")
+
+            print_move_history(tracker)
+
+            print("\n=== ENGINE SUGGESTION ===")
+            if suggestion:
+                print("Move:", suggestion["move"])
+                print("Explanation:", suggestion["explanation"])
+            else:
+                print("No legal move found or engine failed.")
+
             last_print = now
 
         key = cv2.waitKey(1) & 0xFF
@@ -791,6 +1089,9 @@ def main() -> None:
                 print("left_hand =", regions.left_hand.as_dict())
                 print("right_hand=", regions.right_hand.as_dict())
                 print("monitor   =", active_monitor)
+
+                tracker = TrackerState(side_to_move=INITIAL_SIDE_TO_MOVE)
+                print("Tracker reset after region re-detection.")
             except RuntimeError as exc:
                 print(f"Re-detection failed: {exc}")
         elif key == ord("s"):
