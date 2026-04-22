@@ -510,8 +510,7 @@ def move_ordering_bonus(position: Position, move: Move, side: str) -> int:
         bonus += 100000
     return bonus
 
-
-# ---------- Capture-state integration ----------
+#Capture-state integration 
 
 def parse_capture_label(label: str) -> Optional[Piece]:
     """
