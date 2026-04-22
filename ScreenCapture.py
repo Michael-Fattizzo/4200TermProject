@@ -10,7 +10,7 @@ import cv2
 import mss
 import numpy as np
 
-from shogi_engine import (
+from shogiEngine import (
     BLACK,
     WHITE,
     Move,

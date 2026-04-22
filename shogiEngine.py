@@ -372,3 +372,250 @@ def is_checkmate(position: Position, side: str) -> bool:
         return False
     return len(generate_legal_moves(position, side)) == 0
 
+
+PIECE_VALUES = {
+    "P": 100,
+    "L": 300,
+    "N": 300,
+    "S": 500,
+    "G": 600,
+    "B": 800,
+    "R": 1000,
+    "K": 10000,
+}
+
+PROMOTION_BONUS = {
+    "P": 400,
+    "L": 300,
+    "N": 300,
+    "S": 200,
+    "B": 500,
+    "R": 500,
+}
+
+
+def evaluate(position: Position, side: str) -> int:
+    score = 0
+
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            p = position.board[r][c]
+            if p is None:
+                continue
+            value = PIECE_VALUES[p.kind] + (PROMOTION_BONUS.get(p.kind, 0) if p.promoted else 0)
+
+            centrality = 4 - abs(4 - r) + 4 - abs(4 - c)
+            value += 5 * centrality
+
+            if p.owner == side:
+                score += value
+            else:
+                score -= value
+
+    for s in (BLACK, WHITE):
+        hand_score = 0
+        for kind, count in position.hands[s].items():
+            hand_score += PIECE_VALUES[kind] * count
+        if s == side:
+            score += hand_score
+        else:
+            score -= hand_score
+
+    my_king = position.king_square(side)
+    opp_king = position.king_square(opponent(side))
+    if my_king:
+        score -= king_exposure_penalty(position, my_king, side)
+    if opp_king:
+        score += king_exposure_penalty(position, opp_king, opponent(side))
+
+    if in_check(position, opponent(side)):
+        score += 250
+    if in_check(position, side):
+        score -= 250
+
+    return score
+
+
+def king_exposure_penalty(position: Position, king_sq: Tuple[int, int], side: str) -> int:
+    penalty = 0
+    kr, kc = king_sq
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            nr, nc = kr + dr, kc + dc
+            if not inside(nr, nc):
+                penalty += 20
+                continue
+            p = position.board[nr][nc]
+            if p is None:
+                penalty += 15
+            elif p.owner != side:
+                penalty += 30
+    return penalty
+
+
+def choose_best_move(position: Position, side: str, depth: int = 2) -> Optional[Move]:
+    legal = generate_legal_moves(position, side)
+    if not legal:
+        return None
+
+    best_move = None
+    best_score = -10**18
+
+    for move in legal:
+        nxt = apply_move(position, move)
+        score = -negamax(nxt, opponent(side), depth - 1, -10**18, 10**18)
+        score += move_ordering_bonus(position, move, side)
+        if score > best_score:
+            best_score = score
+            best_move = move
+
+    return best_move
+
+
+def negamax(position: Position, side: str, depth: int, alpha: int, beta: int) -> int:
+    legal = generate_legal_moves(position, side)
+
+    if depth == 0 or not legal:
+        if not legal and in_check(position, side):
+            return -1000000
+        return evaluate(position, side)
+
+    best = -10**18
+    for move in legal:
+        nxt = apply_move(position, move)
+        val = -negamax(nxt, opponent(side), depth - 1, -beta, -alpha)
+        if val > best:
+            best = val
+        if best > alpha:
+            alpha = best
+        if alpha >= beta:
+            break
+    return best
+
+
+def move_ordering_bonus(position: Position, move: Move, side: str) -> int:
+    bonus = 0
+    target = position.piece_at(move.to_sq)
+    if target is not None and target.owner != side:
+        bonus += PIECE_VALUES[target.kind] * 2
+    if move.promote:
+        bonus += 150
+
+    nxt = apply_move(position, move)
+    if in_check(nxt, opponent(side)):
+        bonus += 200
+    if is_checkmate(nxt, opponent(side)):
+        bonus += 100000
+    return bonus
+
+
+# ---------- Capture-state integration ----------
+
+def parse_capture_label(label: str) -> Optional[Piece]:
+    """
+    Expected labels from the screen reader:
+      black_P, white_P, black_+P, white_+P, ...
+      or bP / wP / b+P / w+P
+    Empty / unknown labels return None.
+    """
+    if label in {"empty", ".", "blank", "unknown", ""}:
+        return None
+
+    promoted = "+" in label
+    cleaned = label.replace("+", "")
+
+    if "_" in cleaned:
+        side_str, kind = cleaned.split("_", 1)
+        owner = BLACK if side_str.lower().startswith(("b", "black", "sente")) else WHITE
+        return Piece(kind=kind.upper(), owner=owner, promoted=promoted)
+
+    if len(cleaned) >= 2 and cleaned[0].lower() in {"b", "w"}:
+        owner = BLACK if cleaned[0].lower() == "b" else WHITE
+        kind = cleaned[1:].upper()
+        return Piece(kind=kind, owner=owner, promoted=promoted)
+
+    raise ValueError(f"Unsupported capture label format: {label}")
+
+
+def position_from_capture_state(
+    capture_state: Dict[str, object],
+    side_to_move: str,
+    left_hand_owner: str = WHITE,
+    right_hand_owner: str = BLACK,
+) -> Position:
+    """
+    Converts the existing screen-capture output into an engine position.
+    Assumes:
+      - capture_state['board'] is a 9x9 matrix of dicts with a 'label' key
+      - capture_state['left_hand'] and ['right_hand'] are slot dicts with 'piece' and 'count'
+    """
+    pos = Position(side_to_move=side_to_move)
+
+    board_rows = capture_state["board"]
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            cell = board_rows[r][c]
+            piece = parse_capture_label(cell["label"])
+            pos.board[r][c] = piece
+
+    for slot in capture_state.get("left_hand", []):
+        piece = slot.get("piece", ".")
+        count = int(slot.get("count", 0))
+        if piece not in {".", "empty", "blank", "unknown"} and count > 0:
+            pos.hands[left_hand_owner][piece.replace("+", "").upper()] += count
+
+    for slot in capture_state.get("right_hand", []):
+        piece = slot.get("piece", ".")
+        count = int(slot.get("count", 0))
+        if piece not in {".", "empty", "blank", "unknown"} and count > 0:
+            pos.hands[right_hand_owner][piece.replace("+", "").upper()] += count
+
+    return pos
+
+
+def suggest_move_from_capture_state(
+    capture_state: Dict[str, object],
+    side_to_move: str,
+    depth: int = 2,
+    left_hand_owner: str = WHITE,
+    right_hand_owner: str = BLACK,
+) -> Optional[Dict[str, object]]:
+    pos = position_from_capture_state(
+        capture_state=capture_state,
+        side_to_move=side_to_move,
+        left_hand_owner=left_hand_owner,
+        right_hand_owner=right_hand_owner,
+    )
+    move = choose_best_move(pos, side_to_move, depth=depth)
+    if move is None:
+        return None
+
+    explanation = []
+    nxt = apply_move(pos, move)
+
+    if move.drop:
+        explanation.append(f"Drop {move.piece} on {square_to_usi(move.to_sq)}.")
+    else:
+        explanation.append(
+            f"Move {move.piece} from {square_to_usi(move.from_sq)} to {square_to_usi(move.to_sq)}"
+            + (" and promote." if move.promote else ".")
+        )
+
+    if move.captured:
+        explanation.append(f"It captures {move.captured}.")
+    if in_check(nxt, opponent(side_to_move)):
+        explanation.append("The move gives check.")
+    if is_checkmate(nxt, opponent(side_to_move)):
+        explanation.append("The move is checkmate.")
+
+    return {
+        "move": move.usi(),
+        "drop": move.drop,
+        "promote": move.promote,
+        "from": move.from_sq,
+        "to": move.to_sq,
+        "piece": move.piece,
+        "explanation": " ".join(explanation),
+    }
