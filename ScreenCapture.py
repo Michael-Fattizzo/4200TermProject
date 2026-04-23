@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import glob
@@ -10,10 +11,8 @@ import cv2
 import mss
 import numpy as np
 
-
-# =========================
-# Configuration
-# =========================
+from CNNClassifier import BoardCNNClassifier
+from occupancyCNNClassifier import OccupancyCNNClassifier
 
 DEBUG_WINDOW_SCALE = 1.0
 BOARD_MIN_AREA = 40_000
@@ -23,29 +22,26 @@ BOARD_ASPECT_MAX = 1.20
 HAND_GAP_RATIO = 0.025
 HAND_WIDTH_RATIO = 0.12
 BOARD_PAD_RATIO = 0.02
-
-# Optional small post-detect shrink if the box tends to sit outside the board lines.
 BOARD_SHRINK_FRAC = 0.00
 
 HAND_SLOT_COUNT = 7
 SAVE_DIR = "capture_debug"
 CELL_SAVE_DIR = "debug_cells"
 TEMPLATE_ROOT = "templates"
+CNN_CHECKPOINT = "board_cnn.pt"
+OCCUPANCY_CHECKPOINT = "occupancy_cnn.pt"
 
-BOARD_MATCH_THRESHOLD = 0.48
+CNN_CONFIDENCE_THRESHOLD = 0.55
+CNN_AMBIGUITY_MARGIN = 0.08
+OCCUPANCY_EMPTY_THRESHOLD = 0.70
+
 HAND_MATCH_THRESHOLD = 0.48
 DIGIT_MATCH_THRESHOLD = 0.45
-PROMOTION_RED_RATIO_THRESHOLD = 0.03
 
 SAVE_DETECTION_DEBUG = True
 DETECTION_DEBUG_PREFIX = "detection_debug_monitor_"
-
 STARTUP_DELAY_SECONDS = 5
 
-
-# =========================
-# Data classes
-# =========================
 
 @dataclass
 class Region:
@@ -63,12 +59,7 @@ class Region:
         return self.top + self.height
 
     def as_dict(self) -> Dict[str, int]:
-        return {
-            "left": self.left,
-            "top": self.top,
-            "width": self.width,
-            "height": self.height,
-        }
+        return {"left": self.left, "top": self.top, "width": self.width, "height": self.height}
 
 
 @dataclass
@@ -77,10 +68,6 @@ class Regions:
     left_hand: Region
     right_hand: Region
 
-
-# =========================
-# Screen capture
-# =========================
 
 def capture_monitor(monitor_index: int) -> np.ndarray:
     with mss.mss() as sct:
@@ -98,10 +85,6 @@ def crop_region(image: np.ndarray, region: Region) -> np.ndarray:
     return image[y1:y2, x1:x2].copy()
 
 
-# =========================
-# Debug / saving helpers
-# =========================
-
 def ensure_save_dir() -> None:
     os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -116,7 +99,6 @@ def save_detection_debug(image: np.ndarray, name: str) -> None:
 def save_calibration_images(screen: np.ndarray, regions: Regions) -> None:
     ensure_save_dir()
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-
     cv2.imwrite(os.path.join(SAVE_DIR, f"{timestamp}_full_screen.png"), screen)
     cv2.imwrite(os.path.join(SAVE_DIR, f"{timestamp}_board.png"), crop_region(screen, regions.board))
     cv2.imwrite(os.path.join(SAVE_DIR, f"{timestamp}_left_hand.png"), crop_region(screen, regions.left_hand))
@@ -127,13 +109,10 @@ def save_board_cells(board_img: np.ndarray, out_dir: str = CELL_SAVE_DIR) -> str
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     full_dir = os.path.join(out_dir, timestamp)
     os.makedirs(full_dir, exist_ok=True)
-
     cells = split_board_into_cells(board_img)
     for r, row in enumerate(cells):
         for c, cell in enumerate(row):
-            path = os.path.join(full_dir, f"cell_r{r}_c{c}.png")
-            cv2.imwrite(path, cell)
-
+            cv2.imwrite(os.path.join(full_dir, f"cell_r{r}_c{c}.png"), cell)
     return full_dir
 
 
@@ -147,54 +126,29 @@ def show_all_cells(board_img: np.ndarray) -> None:
 def shrink_region(region: Region, frac: float = BOARD_SHRINK_FRAC) -> Region:
     if frac <= 0:
         return region
-
     dx = int(region.width * frac)
     dy = int(region.height * frac)
-    new_w = max(1, region.width - 2 * dx)
-    new_h = max(1, region.height - 2 * dy)
+    return Region(left=region.left + dx, top=region.top + dy, width=max(1, region.width - 2 * dx), height=max(1, region.height - 2 * dy))
 
-    return Region(
-        left=region.left + dx,
-        top=region.top + dy,
-        width=new_w,
-        height=new_h,
-    )
-
-
-# =========================
-# Detection
-# =========================
 
 def refine_board_region_from_grid(image: np.ndarray, rough: Region) -> Optional[Region]:
     roi = crop_region(image, rough)
     if roi.size == 0:
         return None
-
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     edges = cv2.Canny(blur, 50, 150)
-
     min_len = int(min(rough.width, rough.height) * 0.5)
-    lines = cv2.HoughLinesP(
-        edges,
-        1,
-        np.pi / 180,
-        threshold=80,
-        minLineLength=max(20, min_len),
-        maxLineGap=10,
-    )
-
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=max(20, min_len), maxLineGap=10)
     if lines is None:
         return None
 
     vertical_x: List[int] = []
     horizontal_y: List[int] = []
-
     for line in lines:
         x1, y1, x2, y2 = line[0]
         dx = abs(x2 - x1)
         dy = abs(y2 - y1)
-
         if dx < 8 and dy > rough.height * 0.4:
             vertical_x.append((x1 + x2) // 2)
         elif dy < 8 and dx > rough.width * 0.4:
@@ -203,74 +157,41 @@ def refine_board_region_from_grid(image: np.ndarray, rough: Region) -> Optional[
     if len(vertical_x) < 6 or len(horizontal_y) < 6:
         return None
 
-    vertical_x.sort()
-    horizontal_y.sort()
-
     left = min(vertical_x)
     right = max(vertical_x)
     top = min(horizontal_y)
     bottom = max(horizontal_y)
-
     if right <= left or bottom <= top:
         return None
 
     pad_x = int((right - left) * 0.02)
     pad_y = int((bottom - top) * 0.02)
-
     left = max(0, left - pad_x)
     right = min(roi.shape[1] - 1, right + pad_x)
     top = max(0, top - pad_y)
     bottom = min(roi.shape[0] - 1, bottom + pad_y)
 
-    width = right - left
-    height = bottom - top
-    side = max(width, height)
-
+    side = max(right - left, bottom - top)
     cx = (left + right) // 2
     cy = (top + bottom) // 2
-
     half = side // 2
-    new_left = cx - half
-    new_top = cy - half
-    new_right = new_left + side
-    new_bottom = new_top + side
 
-    if new_left < 0:
-        new_right -= new_left
-        new_left = 0
-    if new_top < 0:
-        new_bottom -= new_top
-        new_top = 0
-    if new_right > roi.shape[1]:
-        shift = new_right - roi.shape[1]
-        new_left -= shift
-        new_right = roi.shape[1]
-    if new_bottom > roi.shape[0]:
-        shift = new_bottom - roi.shape[0]
-        new_top -= shift
-        new_bottom = roi.shape[0]
+    new_left = max(0, cx - half)
+    new_top = max(0, cy - half)
+    new_right = min(roi.shape[1], new_left + side)
+    new_bottom = min(roi.shape[0], new_top + side)
 
-    new_left = max(0, new_left)
-    new_top = max(0, new_top)
-
-    return Region(
-        left=rough.left + new_left,
-        top=rough.top + new_top,
-        width=new_right - new_left,
-        height=new_bottom - new_top,
-    )
+    return Region(left=rough.left + new_left, top=rough.top + new_top, width=new_right - new_left, height=new_bottom - new_top)
 
 
 def detect_shogi_board(image: np.ndarray) -> Optional[Region]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 30, 120)
-
     contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    best_rect: Optional[Tuple[int, int, int, int]] = None
+    best_rect = None
     best_score = float("-inf")
-
     img_h, img_w = image.shape[:2]
     center_x = img_w / 2.0
     center_y = img_h / 2.0
@@ -278,24 +199,19 @@ def detect_shogi_board(image: np.ndarray) -> Optional[Region]:
     for cnt in contours:
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-
         if len(approx) != 4:
             continue
-
         x, y, w, h = cv2.boundingRect(approx)
         area = w * h
         if area < BOARD_MIN_AREA:
             continue
-
         aspect = w / float(h)
         if not (BOARD_ASPECT_MIN <= aspect <= BOARD_ASPECT_MAX):
             continue
-
         rect_center_x = x + w / 2.0
         rect_center_y = y + h / 2.0
-        dist_to_center = ((rect_center_x - center_x) ** 2 + (rect_center_y - center_y) ** 2) ** 0.5
-
-        score = area - dist_to_center * 120
+        dist = ((rect_center_x - center_x) ** 2 + (rect_center_y - center_y) ** 2) ** 0.5
+        score = area - dist * 120
         if score > best_score:
             best_score = score
             best_rect = (x, y, w, h)
@@ -305,32 +221,20 @@ def detect_shogi_board(image: np.ndarray) -> Optional[Region]:
 
     x, y, w, h = best_rect
     pad = int(min(w, h) * BOARD_PAD_RATIO)
-
-    rough = Region(
-        left=max(0, x - pad),
-        top=max(0, y - pad),
-        width=w + 2 * pad,
-        height=h + 2 * pad,
-    )
-
+    rough = Region(left=max(0, x - pad), top=max(0, y - pad), width=w + 2 * pad, height=h + 2 * pad)
     refined = refine_board_region_from_grid(image, rough)
     board = refined if refined is not None else rough
-    board = shrink_region(board, BOARD_SHRINK_FRAC)
-
-    return board
+    return shrink_region(board, BOARD_SHRINK_FRAC)
 
 
 def manually_select_board(screen: np.ndarray) -> Optional[Region]:
     roi = cv2.selectROI("Select Board", screen, showCrosshair=True, fromCenter=False)
     cv2.destroyWindow("Select Board")
-
     x, y, w, h = roi
     if w <= 0 or h <= 0:
         return None
-
     side = int(min(w, h))
-    board = Region(left=int(x), top=int(y), width=side, height=side)
-    return shrink_region(board, BOARD_SHRINK_FRAC)
+    return shrink_region(Region(left=int(x), top=int(y), width=side, height=side), BOARD_SHRINK_FRAC)
 
 
 def derive_regions(image: np.ndarray, board: Region) -> Regions:
@@ -338,84 +242,44 @@ def derive_regions(image: np.ndarray, board: Region) -> Regions:
     side_gap = int(board.width * HAND_GAP_RATIO)
     hand_width = int(board.width * HAND_WIDTH_RATIO)
 
-    left_hand = Region(
-        left=max(0, board.left - hand_width - side_gap),
-        top=max(0, board.top),
-        width=hand_width,
-        height=board.height,
-    )
-
-    right_hand = Region(
-        left=min(img_w - hand_width, board.right + side_gap),
-        top=max(0, board.top),
-        width=hand_width,
-        height=board.height,
-    )
-
+    left_hand = Region(left=max(0, board.left - hand_width - side_gap), top=max(0, board.top), width=hand_width, height=board.height)
+    right_hand = Region(left=min(img_w - hand_width, board.right + side_gap), top=max(0, board.top), width=hand_width, height=board.height)
     return Regions(board=board, left_hand=left_hand, right_hand=right_hand)
 
 
 def detect_all_regions() -> Tuple[np.ndarray, Regions, int]:
     with mss.mss() as sct:
         monitor_count = len(sct.monitors) - 1
-
     for monitor_index in range(1, monitor_count + 1):
         screen = capture_monitor(monitor_index)
-
         if SAVE_DETECTION_DEBUG:
             save_detection_debug(screen, f"{DETECTION_DEBUG_PREFIX}{monitor_index}.png")
-
         board = detect_shogi_board(screen)
         if board is not None:
-            regions = derive_regions(screen, board)
-            print(f"Detected board on monitor {monitor_index}")
-            return screen, regions, monitor_index
-
+            return screen, derive_regions(screen, board), monitor_index
     screen = capture_monitor(1)
     print("Auto-detection failed. Please drag a box around the board.")
     board = manually_select_board(screen)
     if board is not None:
-        regions = derive_regions(screen, board)
-        return screen, regions, 1
-
+        return screen, derive_regions(screen, board), 1
     raise RuntimeError("Could not detect shogi board.")
 
 
-# =========================
-# Internal grid detection
-# =========================
-
 def detect_internal_grid_bounds(board_img: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """
-    Detect the 10 vertical and 10 horizontal board boundaries inside the already-cropped board.
-    Returns (xs, ys), each length 10.
-    """
     gray = cv2.cvtColor(board_img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     edges = cv2.Canny(blur, 50, 150)
-
-    lines = cv2.HoughLinesP(
-        edges,
-        1,
-        np.pi / 180,
-        threshold=60,
-        minLineLength=int(min(board_img.shape[:2]) * 0.5),
-        maxLineGap=8,
-    )
-
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60, minLineLength=int(min(board_img.shape[:2]) * 0.5), maxLineGap=8)
     if lines is None:
         return None
 
     vertical: List[int] = []
     horizontal: List[int] = []
-
     h, w = board_img.shape[:2]
-
     for line in lines:
         x1, y1, x2, y2 = line[0]
         dx = abs(x2 - x1)
         dy = abs(y2 - y1)
-
         if dx < 6 and dy > h * 0.5:
             vertical.append((x1 + x2) // 2)
         elif dy < 6 and dx > w * 0.5:
@@ -424,205 +288,76 @@ def detect_internal_grid_bounds(board_img: np.ndarray) -> Optional[Tuple[np.ndar
     if len(vertical) < 6 or len(horizontal) < 6:
         return None
 
-    vertical = np.array(sorted(vertical))
-    horizontal = np.array(sorted(horizontal))
-
-    def cluster_lines(vals: np.ndarray, gap: int = 10) -> np.ndarray:
-        if len(vals) == 0:
-            return vals
-
-        groups = [[int(vals[0])]]
+    def cluster(vals: List[int], gap: int = 10) -> np.ndarray:
+        vals = sorted(vals)
+        groups = [[vals[0]]]
         for v in vals[1:]:
-            if abs(int(v) - groups[-1][-1]) <= gap:
-                groups[-1].append(int(v))
+            if abs(v - groups[-1][-1]) <= gap:
+                groups[-1].append(v)
             else:
-                groups.append([int(v)])
-
+                groups.append([v])
         return np.array([int(round(sum(g) / len(g))) for g in groups], dtype=int)
 
-    vx = cluster_lines(vertical, gap=10)
-    hy = cluster_lines(horizontal, gap=10)
-
+    vx = cluster(vertical)
+    hy = cluster(horizontal)
     if len(vx) < 2 or len(hy) < 2:
         return None
-
-    left = int(vx[0])
-    right = int(vx[-1])
-    top = int(hy[0])
-    bottom = int(hy[-1])
-
-    if right <= left or bottom <= top:
-        return None
-
-    xs = np.linspace(left, right, 10).astype(int)
-    ys = np.linspace(top, bottom, 10).astype(int)
-
-    return xs, ys
+    return np.linspace(int(vx[0]), int(vx[-1]), 10).astype(int), np.linspace(int(hy[0]), int(hy[-1]), 10).astype(int)
 
 
 def get_board_grid_boundaries(board_img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     detected = detect_internal_grid_bounds(board_img)
     if detected is not None:
         return detected
-
     h, w = board_img.shape[:2]
-    xs = np.linspace(0, w, 10).astype(int)
-    ys = np.linspace(0, h, 10).astype(int)
-    return xs, ys
+    return np.linspace(0, w, 10).astype(int), np.linspace(0, h, 10).astype(int)
 
-
-# =========================
-# Splitting helpers
-# =========================
 
 def split_board_into_cells(board_img: np.ndarray) -> List[List[np.ndarray]]:
     xs, ys = get_board_grid_boundaries(board_img)
-
-    cells: List[List[np.ndarray]] = []
+    out = []
     for row in range(9):
-        row_cells: List[np.ndarray] = []
+        row_cells = []
         for col in range(9):
             x1, x2 = xs[col], xs[col + 1]
             y1, y2 = ys[row], ys[row + 1]
             row_cells.append(board_img[y1:y2, x1:x2].copy())
-        cells.append(row_cells)
-    return cells
-
-
-def split_hand_into_slots(hand_img: np.ndarray, num_slots: int = HAND_SLOT_COUNT) -> List[np.ndarray]:
-    h, _ = hand_img.shape[:2]
-    slot_h = h / float(num_slots)
-
-    slots: List[np.ndarray] = []
-    for i in range(num_slots):
-        y1 = int(round(i * slot_h))
-        y2 = int(round((i + 1) * slot_h))
-        slots.append(hand_img[y1:y2, :].copy())
-    return slots
-
-
-# =========================
-# Template loading
-# =========================
-
-def load_templates(template_root: str = TEMPLATE_ROOT) -> Dict[str, Dict[str, List[np.ndarray]]]:
-    out: Dict[str, Dict[str, List[np.ndarray]]] = {"board": {}, "hand": {}}
-
-    for group in ("board", "hand"):
-        group_dir = os.path.join(template_root, group)
-        if not os.path.isdir(group_dir):
-            continue
-
-        for label in os.listdir(group_dir):
-            label_dir = os.path.join(group_dir, label)
-            if not os.path.isdir(label_dir):
-                continue
-
-            imgs: List[np.ndarray] = []
-            for path in glob.glob(os.path.join(label_dir, "*")):
-                img = cv2.imread(path, cv2.IMREAD_COLOR)
-                if img is not None:
-                    imgs.append(img)
-
-            if imgs:
-                out[group][label] = imgs
-
+        out.append(row_cells)
     return out
 
-
-def load_digit_templates(template_root: str = TEMPLATE_ROOT) -> Dict[str, List[np.ndarray]]:
-    digit_templates: Dict[str, List[np.ndarray]] = {}
-    digits_dir = os.path.join(template_root, "digits")
-
-    if not os.path.isdir(digits_dir):
-        return digit_templates
-
-    for label in os.listdir(digits_dir):
-        label_dir = os.path.join(digits_dir, label)
-        if not os.path.isdir(label_dir):
-            continue
-
-        imgs: List[np.ndarray] = []
-        for path in glob.glob(os.path.join(label_dir, "*")):
-            img = cv2.imread(path, cv2.IMREAD_COLOR)
-            if img is not None:
-                imgs.append(img)
-
-        if imgs:
-            digit_templates[label] = imgs
-
-    return digit_templates
-
-
-# =========================
-# Preprocessing
-# =========================
 
 def normalize_img(img: np.ndarray) -> np.ndarray:
     return cv2.equalizeHist(img)
 
 
-def preprocess_board_cell(cell_img: np.ndarray, out_size: Tuple[int, int] = (64, 64)) -> np.ndarray:
-    gray = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-
-    h, w = gray.shape
-    mx = int(w * 0.08)
-    my = int(h * 0.08)
-
-    x1 = min(mx, w - 1)
-    y1 = min(my, h - 1)
-    x2 = max(x1 + 1, w - mx)
-    y2 = max(y1 + 1, h - my)
-
-    cropped = gray[y1:y2, x1:x2]
-    return cv2.resize(cropped, out_size, interpolation=cv2.INTER_AREA)
-
-
 def preprocess_hand_slot(slot_img: np.ndarray, out_size: Tuple[int, int] = (64, 96)) -> np.ndarray:
     gray = cv2.cvtColor(slot_img, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
-
     h, w = gray.shape
     mx = int(w * 0.08)
     my = int(h * 0.05)
-
     x1 = min(mx, w - 1)
     y1 = min(my, h - 1)
     x2 = max(x1 + 1, w - mx)
     y2 = max(y1 + 1, h - my)
-
     cropped = gray[y1:y2, x1:x2]
     return cv2.resize(cropped, out_size, interpolation=cv2.INTER_AREA)
 
 
 def preprocess_digit_img(img: np.ndarray, out_size: Tuple[int, int] = (24, 32)) -> np.ndarray:
-    if len(img.shape) == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = img.copy()
-
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     gray = cv2.equalizeHist(gray)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return cv2.resize(thresh, out_size, interpolation=cv2.INTER_AREA)
 
 
-# =========================
-# Template scoring
-# =========================
-
 def score_template(query: np.ndarray, tmpl: np.ndarray) -> float:
     if len(tmpl.shape) == 3:
         tmpl = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
-
     if query.shape != tmpl.shape:
         tmpl = cv2.resize(tmpl, (query.shape[1], query.shape[0]), interpolation=cv2.INTER_AREA)
-
-    query_n = normalize_img(query)
-    tmpl_n = normalize_img(tmpl)
-
-    res = cv2.matchTemplate(query_n, tmpl_n, cv2.TM_CCOEFF_NORMED)
+    res = cv2.matchTemplate(normalize_img(query), normalize_img(tmpl), cv2.TM_CCOEFF_NORMED)
     _, max_val, _, _ = cv2.minMaxLoc(res)
     return float(max_val)
 
@@ -630,147 +365,94 @@ def score_template(query: np.ndarray, tmpl: np.ndarray) -> float:
 def best_template_match(query: np.ndarray, template_bank: Dict[str, List[np.ndarray]]) -> Tuple[str, float]:
     best_label = "unknown"
     best_score = -1.0
-
     for label, tmpls in template_bank.items():
         for tmpl in tmpls:
             score = score_template(query, tmpl)
             if score > best_score:
                 best_score = score
                 best_label = label
-
     return best_label, best_score
 
 
 def match_digit_templates(digit_img: np.ndarray, digit_templates: Dict[str, List[np.ndarray]]) -> Tuple[str, float]:
     query = preprocess_digit_img(digit_img)
-
     best_label = "?"
     best_score = -1.0
-
     for label, tmpls in digit_templates.items():
         for tmpl in tmpls:
             score = score_template(query, preprocess_digit_img(tmpl))
             if score > best_score:
                 best_score = score
                 best_label = label
-
     return best_label, best_score
 
 
-# =========================
-# Promoted piece helpers
-# =========================
+def classify_board_cell(cell_img: np.ndarray, occupancy_classifier: OccupancyCNNClassifier, piece_classifier: BoardCNNClassifier) -> Dict[str, Any]:
+    occ_label, occ_conf, occ_prob = occupancy_classifier.predict(cell_img)
+    if occ_label == "empty" and occ_conf >= OCCUPANCY_EMPTY_THRESHOLD:
+        return {"label": "empty", "score": round(occ_conf, 4), "occupied": False, "occ_prob": round(occ_prob, 4)}
 
-def red_ratio(cell_img: np.ndarray) -> float:
-    hsv = cv2.cvtColor(cell_img, cv2.COLOR_BGR2HSV)
+    preds = piece_classifier.predict_topk(cell_img, k=3)
+    if not preds:
+        return {"label": "unknown", "score": 0.0, "occupied": True, "occ_prob": round(occ_prob, 4)}
 
-    lower_red1 = np.array([0, 70, 50], dtype=np.uint8)
-    upper_red1 = np.array([10, 255, 255], dtype=np.uint8)
+    best_label, best_score = preds[0]
+    second_score = preds[1][1] if len(preds) > 1 else 0.0
 
-    lower_red2 = np.array([170, 70, 50], dtype=np.uint8)
-    upper_red2 = np.array([180, 255, 255], dtype=np.uint8)
+    if best_score < CNN_CONFIDENCE_THRESHOLD or (best_score - second_score) < CNN_AMBIGUITY_MARGIN:
+        return {"label": "unknown", "score": round(best_score, 4), "occupied": True, "occ_prob": round(occ_prob, 4)}
 
-    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    red_mask = cv2.bitwise_or(mask1, mask2)
+    return {"label": best_label, "score": round(best_score, 4), "occupied": True, "occ_prob": round(occ_prob, 4)}
 
-    return float(np.count_nonzero(red_mask) / red_mask.size)
-
-
-def is_red_promoted(cell_img: np.ndarray, red_ratio_threshold: float = PROMOTION_RED_RATIO_THRESHOLD) -> bool:
-    return red_ratio(cell_img) >= red_ratio_threshold
-
-
-def normalize_promoted_label(label: str, promoted_detected: bool) -> str:
-    if label in ("empty", ".", "blank", "unknown"):
-        return label
-
-    if promoted_detected and "+" not in label:
-        if label[-1] in ("P", "L", "N", "S", "B", "R"):
-            return label + "+"
-
-    if not promoted_detected and "+" in label:
-        return label.replace("+", "")
-
-    return label
-
-
-# =========================
-# Hand count badge reading
-# =========================
 
 def extract_count_badge(slot_img: np.ndarray) -> Optional[np.ndarray]:
     h, w = slot_img.shape[:2]
-
     x1 = int(w * 0.45)
     y1 = int(h * 0.55)
     x2 = int(w * 0.98)
     y2 = int(h * 0.98)
-
     if x2 <= x1 or y2 <= y1:
         return None
-
     badge = slot_img[y1:y2, x1:x2].copy()
-    if badge.size == 0:
-        return None
-
-    return badge
+    return None if badge.size == 0 else badge
 
 
 def segment_badge_digits(badge_img: np.ndarray) -> List[np.ndarray]:
     gray = cv2.cvtColor(badge_img, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     gray = cv2.equalizeHist(gray)
-
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    white_ratio = np.count_nonzero(thresh) / thresh.size
-    if white_ratio > 0.7:
+    if np.count_nonzero(thresh) / thresh.size > 0.7:
         thresh = cv2.bitwise_not(thresh)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     digit_boxes: List[Tuple[int, int, int, int]] = []
     h, w = thresh.shape[:2]
-
     for cnt in contours:
         x, y, cw, ch = cv2.boundingRect(cnt)
-        area = cw * ch
-        if area < 20:
-            continue
-        if ch < h * 0.25:
+        if cw * ch < 20 or ch < h * 0.25:
             continue
         digit_boxes.append((x, y, cw, ch))
-
-    if not digit_boxes:
-        return []
-
     digit_boxes.sort(key=lambda b: b[0])
 
-    digit_imgs: List[np.ndarray] = []
+    out = []
     for x, y, cw, ch in digit_boxes:
         pad = 2
         x1 = max(0, x - pad)
         y1 = max(0, y - pad)
         x2 = min(w, x + cw + pad)
         y2 = min(h, y + ch + pad)
-        digit_imgs.append(thresh[y1:y2, x1:x2].copy())
-
-    return digit_imgs
+        out.append(thresh[y1:y2, x1:x2].copy())
+    return out
 
 
 def fallback_hand_count(slot_img: np.ndarray) -> int:
     gray = cv2.cvtColor(slot_img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 60, 160)
-    edge_density = np.count_nonzero(edges) / edges.size
-    return 1 if edge_density > 0.05 else 0
+    return 1 if np.count_nonzero(edges) / edges.size > 0.05 else 0
 
 
-def read_badge_count(
-    slot_img: np.ndarray,
-    digit_templates: Dict[str, List[np.ndarray]],
-    min_score: float = DIGIT_MATCH_THRESHOLD,
-) -> int:
+def read_badge_count(slot_img: np.ndarray, digit_templates: Dict[str, List[np.ndarray]], min_score: float = DIGIT_MATCH_THRESHOLD) -> int:
     badge = extract_count_badge(slot_img)
     if badge is None:
         return fallback_hand_count(slot_img)
@@ -782,238 +464,150 @@ def read_badge_count(
     digits: List[str] = []
     for digit_img in digit_imgs:
         label, score = match_digit_templates(digit_img, digit_templates)
-        if score < min_score or not label.isdigit():
-            continue
-        digits.append(label)
+        if score >= min_score and label.isdigit():
+            digits.append(label)
 
     if not digits:
         return fallback_hand_count(slot_img)
 
     try:
-        value = int("".join(digits))
-        return max(1, value)
+        return max(1, int("".join(digits)))
     except ValueError:
         return fallback_hand_count(slot_img)
 
 
-# =========================
-# Recognition
-# =========================
-
-def classify_board_cell(
-    cell_img: np.ndarray,
-    templates: Dict[str, Dict[str, List[np.ndarray]]],
-    threshold: float = BOARD_MATCH_THRESHOLD,
-) -> Dict[str, Any]:
-    query = preprocess_board_cell(cell_img)
-    board_templates = templates.get("board", {})
-
-    if not board_templates:
-        return {
-            "label": "unknown",
-            "score": 0.0,
-            "occupied": False,
-            "promoted": False,
-            "red_ratio": 0.0,
-        }
-
-    promoted_detected = is_red_promoted(cell_img)
-    rr = red_ratio(cell_img)
-
-    if promoted_detected:
-        filtered_templates = {
-            label: imgs
-            for label, imgs in board_templates.items()
-            if "+" in label or label in ("empty", ".", "blank")
-        }
-    else:
-        filtered_templates = {
-            label: imgs
-            for label, imgs in board_templates.items()
-            if "+" not in label or label in ("empty", ".", "blank")
-        }
-
-    if not filtered_templates:
-        filtered_templates = board_templates
-
-    label, score = best_template_match(query, filtered_templates)
-    label = normalize_promoted_label(label, promoted_detected)
-
-    if score < threshold:
-        return {
-            "label": "unknown",
-            "score": round(score, 4),
-            "occupied": False,
-            "promoted": promoted_detected,
-            "red_ratio": round(rr, 4),
-        }
-
-    occupied = label not in ("empty", ".", "blank")
-    return {
-        "label": label,
-        "score": round(score, 4),
-        "occupied": occupied,
-        "promoted": "+" in label,
-        "red_ratio": round(rr, 4),
-    }
-
-
-def classify_hand_slot(
-    slot_img: np.ndarray,
-    templates: Dict[str, Dict[str, List[np.ndarray]]],
-    digit_templates: Dict[str, List[np.ndarray]],
-    threshold: float = HAND_MATCH_THRESHOLD,
-) -> Dict[str, Any]:
+def classify_hand_slot(slot_img: np.ndarray, templates: Dict[str, Dict[str, List[np.ndarray]]], digit_templates: Dict[str, List[np.ndarray]]) -> Dict[str, Any]:
     query = preprocess_hand_slot(slot_img)
-
     hand_templates = templates.get("hand", {})
     if not hand_templates:
         return {"occupied": False, "piece": "unknown", "count": 0, "score": 0.0}
 
     label, score = best_template_match(query, hand_templates)
-
-    if score < threshold or label in ("empty", ".", "blank"):
+    if score < HAND_MATCH_THRESHOLD or label in ("empty", ".", "blank"):
         return {"occupied": False, "piece": ".", "count": 0, "score": round(score, 4)}
 
-    count = read_badge_count(slot_img, digit_templates)
-    return {
-        "occupied": True,
-        "piece": label,
-        "count": count,
-        "score": round(score, 4),
-    }
+    return {"occupied": True, "piece": label, "count": read_badge_count(slot_img, digit_templates), "score": round(score, 4)}
 
 
-# =========================
-# State extraction
-# =========================
+def split_hand_into_slots(hand_img: np.ndarray, num_slots: int = HAND_SLOT_COUNT) -> List[np.ndarray]:
+    h, _ = hand_img.shape[:2]
+    slot_h = h / float(num_slots)
+    return [hand_img[int(round(i * slot_h)):int(round((i + 1) * slot_h)), :].copy() for i in range(num_slots)]
 
-def extract_state(
-    screen: np.ndarray,
-    regions: Regions,
-    templates: Dict[str, Dict[str, List[np.ndarray]]],
-    digit_templates: Dict[str, List[np.ndarray]],
-) -> Dict[str, object]:
+
+def extract_state(screen: np.ndarray, regions: Regions, occupancy_classifier: OccupancyCNNClassifier, piece_classifier: BoardCNNClassifier, templates: Dict[str, Dict[str, List[np.ndarray]]], digit_templates: Dict[str, List[np.ndarray]]) -> Dict[str, object]:
     board_img = crop_region(screen, regions.board)
     left_hand_img = crop_region(screen, regions.left_hand)
     right_hand_img = crop_region(screen, regions.right_hand)
 
     board_cells = split_board_into_cells(board_img)
-    board_state = [
-        [classify_board_cell(cell, templates) for cell in row]
-        for row in board_cells
-    ]
+    board_state = [[classify_board_cell(cell, occupancy_classifier, piece_classifier) for cell in row] for row in board_cells]
 
-    left_slots = split_hand_into_slots(left_hand_img)
-    right_slots = split_hand_into_slots(right_hand_img)
+    left_hand_state = [classify_hand_slot(slot, templates, digit_templates) for slot in split_hand_into_slots(left_hand_img)]
+    right_hand_state = [classify_hand_slot(slot, templates, digit_templates) for slot in split_hand_into_slots(right_hand_img)]
 
-    left_hand_state = [classify_hand_slot(slot, templates, digit_templates) for slot in left_slots]
-    right_hand_state = [classify_hand_slot(slot, templates, digit_templates) for slot in right_slots]
+    return {"board": board_state, "left_hand": left_hand_state, "right_hand": right_hand_state}
 
-    return {
-        "board": board_state,
-        "left_hand": left_hand_state,
-        "right_hand": right_hand_state,
-    }
-
-
-# =========================
-# Visualization
-# =========================
 
 def draw_regions(image: np.ndarray, regions: Regions) -> np.ndarray:
     vis = image.copy()
-
-    region_specs = [
+    for name, r, color in [
         ("board", regions.board, (0, 255, 0)),
         ("left_hand", regions.left_hand, (255, 200, 0)),
         ("right_hand", regions.right_hand, (0, 200, 255)),
-    ]
-
-    for name, r, color in region_specs:
+    ]:
         cv2.rectangle(vis, (r.left, r.top), (r.right, r.bottom), color, 2)
-        cv2.putText(
-            vis,
-            name,
-            (r.left, max(20, r.top - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
-
+        cv2.putText(vis, name, (r.left, max(20, r.top - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
     return vis
 
 
 def draw_board_grid(board_img: np.ndarray) -> np.ndarray:
     vis = board_img.copy()
     h, w = vis.shape[:2]
-
     xs, ys = get_board_grid_boundaries(board_img)
-
     for x in xs:
         cv2.line(vis, (x, 0), (x, h), (0, 255, 0), 1)
-
     for y in ys:
         cv2.line(vis, (0, y), (w, y), (0, 255, 0), 1)
-
     return vis
 
 
 def draw_hand_slots(hand_img: np.ndarray, num_slots: int = HAND_SLOT_COUNT) -> np.ndarray:
     vis = hand_img.copy()
     h, w = vis.shape[:2]
-
     for i in range(1, num_slots):
         y = int(round(i * h / float(num_slots)))
         cv2.line(vis, (0, y), (w, y), (255, 0, 255), 1)
-
     return vis
 
 
-# =========================
-# Printing helpers
-# =========================
-
 def print_state(state: Dict[str, object]) -> None:
-    print("\n=== BOARD ===")
+    print("\\n=== BOARD ===")
     for row in state["board"]:
         print(" | ".join(f'{cell["label"]}:{cell["score"]:.2f}' for cell in row))
 
-    print("\n=== LEFT HAND ===")
+    print("\\n=== LEFT HAND ===")
     for i, slot in enumerate(state["left_hand"], start=1):
         print(f"slot {i}: {slot}")
 
-    print("\n=== RIGHT HAND ===")
+    print("\\n=== RIGHT HAND ===")
     for i, slot in enumerate(state["right_hand"], start=1):
         print(f"slot {i}: {slot}")
 
 
-# =========================
-# Main app loop
-# =========================
+def load_templates(template_root: str = TEMPLATE_ROOT) -> Dict[str, Dict[str, List[np.ndarray]]]:
+    out: Dict[str, Dict[str, List[np.ndarray]]] = {"board": {}, "hand": {}}
+    for group in ("board", "hand"):
+        group_dir = os.path.join(template_root, group)
+        if not os.path.isdir(group_dir):
+            continue
+        for label in os.listdir(group_dir):
+            label_dir = os.path.join(group_dir, label)
+            if not os.path.isdir(label_dir):
+                continue
+            imgs = []
+            for path in glob.glob(os.path.join(label_dir, "*")):
+                img = cv2.imread(path, cv2.IMREAD_COLOR)
+                if img is not None:
+                    imgs.append(img)
+            if imgs:
+                out[group][label] = imgs
+    return out
+
+
+def load_digit_templates(template_root: str = TEMPLATE_ROOT) -> Dict[str, List[np.ndarray]]:
+    digit_templates: Dict[str, List[np.ndarray]] = {}
+    digits_dir = os.path.join(template_root, "digits")
+    if not os.path.isdir(digits_dir):
+        return digit_templates
+    for label in os.listdir(digits_dir):
+        label_dir = os.path.join(digits_dir, label)
+        if not os.path.isdir(label_dir):
+            continue
+        imgs = []
+        for path in glob.glob(os.path.join(label_dir, "*")):
+            img = cv2.imread(path, cv2.IMREAD_COLOR)
+            if img is not None:
+                imgs.append(img)
+        if imgs:
+            digit_templates[label] = imgs
+    return digit_templates
+
 
 def main() -> None:
-    print("Starting shogi screen reader...")
+    print("Starting shogi screen reader with occupancy CNN + piece CNN...")
     print("Controls: q=quit, r=re-detect board, s=save crops, d=save 81 cells, a=show 81-cell grid")
     print(f"Switch to the shogi board window now... ({STARTUP_DELAY_SECONDS}s)")
     time.sleep(STARTUP_DELAY_SECONDS)
 
+    occupancy_classifier = OccupancyCNNClassifier.load(OCCUPANCY_CHECKPOINT)
+    piece_classifier = BoardCNNClassifier.load(CNN_CHECKPOINT)
     templates = load_templates(TEMPLATE_ROOT)
     digit_templates = load_digit_templates(TEMPLATE_ROOT)
 
-    print("Loaded templates:")
-    for group, classes in templates.items():
-        print(f"  {group}: {list(classes.keys())}")
-    print(f"  digits: {list(digit_templates.keys())}")
-
-    if not templates.get("board"):
-        print("Warning: no board templates loaded from templates/board")
-    if not templates.get("hand"):
-        print("Warning: no hand templates loaded from templates/hand")
-    if not digit_templates:
-        print("Warning: no digit templates loaded from templates/digits")
+    print("Loaded occupancy CNN:", OCCUPANCY_CHECKPOINT)
+    print("Loaded piece CNN:", CNN_CHECKPOINT)
+    print("Piece labels:", sorted(piece_classifier.label_to_index.keys()))
 
     try:
         screen, regions, active_monitor = detect_all_regions()
@@ -1032,10 +626,9 @@ def main() -> None:
 
     while True:
         screen = capture_monitor(active_monitor)
-        state = extract_state(screen, regions, templates, digit_templates)
+        state = extract_state(screen, regions, occupancy_classifier, piece_classifier, templates, digit_templates)
 
         overlay = draw_regions(screen, regions)
-
         board_img = crop_region(screen, regions.board)
         left_hand_img = crop_region(screen, regions.left_hand)
         right_hand_img = crop_region(screen, regions.right_hand)
@@ -1045,13 +638,7 @@ def main() -> None:
         right_hand_debug = draw_hand_slots(right_hand_img)
 
         if DEBUG_WINDOW_SCALE != 1.0:
-            overlay = cv2.resize(
-                overlay,
-                None,
-                fx=DEBUG_WINDOW_SCALE,
-                fy=DEBUG_WINDOW_SCALE,
-                interpolation=cv2.INTER_AREA,
-            )
+            overlay = cv2.resize(overlay, None, fx=DEBUG_WINDOW_SCALE, fy=DEBUG_WINDOW_SCALE, interpolation=cv2.INTER_AREA)
 
         cv2.imshow("Shogi Capture - Overlay", overlay)
         cv2.imshow("Shogi Capture - Board", board_debug)
@@ -1064,13 +651,12 @@ def main() -> None:
             last_print = now
 
         key = cv2.waitKey(1) & 0xFF
-
         if key == ord("q"):
             break
         elif key == ord("r"):
             try:
                 screen, regions, active_monitor = detect_all_regions()
-                print("\nRe-detected regions:")
+                print("\\nRe-detected regions:")
                 print("board     =", regions.board.as_dict())
                 print("left_hand =", regions.left_hand.as_dict())
                 print("right_hand=", regions.right_hand.as_dict())
