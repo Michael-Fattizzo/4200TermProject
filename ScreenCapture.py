@@ -3,26 +3,17 @@ from __future__ import annotations
 import glob
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import mss
 import numpy as np
 
-from shogiEngine import (
-    BLACK,
-    WHITE,
-    Move,
-    Position,
-    apply_move,
-    generate_legal_moves,
-    opponent,
-    parse_capture_label,
-    suggest_move_from_capture_state,
-)
 
+# =========================
 # Configuration
+# =========================
 
 DEBUG_WINDOW_SCALE = 1.0
 BOARD_MIN_AREA = 40_000
@@ -33,8 +24,12 @@ HAND_GAP_RATIO = 0.025
 HAND_WIDTH_RATIO = 0.12
 BOARD_PAD_RATIO = 0.02
 
+# Optional small post-detect shrink if the box tends to sit outside the board lines.
+BOARD_SHRINK_FRAC = 0.00
+
 HAND_SLOT_COUNT = 7
 SAVE_DIR = "capture_debug"
+CELL_SAVE_DIR = "debug_cells"
 TEMPLATE_ROOT = "templates"
 
 BOARD_MATCH_THRESHOLD = 0.48
@@ -47,19 +42,10 @@ DETECTION_DEBUG_PREFIX = "detection_debug_monitor_"
 
 STARTUP_DELAY_SECONDS = 5
 
-# Agent / tracker configuration
 
-INITIAL_SIDE_TO_MOVE = BLACK
-LEFT_HAND_OWNER = WHITE
-RIGHT_HAND_OWNER = BLACK
-
-# A position must remain unchanged for this many consecutive frames
-# before it is treated as "stable" and eligible for move tracking.
-STABLE_FRAMES_REQUIRED = 3
-
-ENGINE_DEPTH = 2
-
+# =========================
 # Data classes
+# =========================
 
 @dataclass
 class Region:
@@ -92,29 +78,9 @@ class Regions:
     right_hand: Region
 
 
-@dataclass
-class TrackedMove:
-    ply: int
-    side: str
-    usi: str
-    explanation: str
-
-
-@dataclass
-class TrackerState:
-    previous_stable_capture_state: Optional[Dict[str, object]] = None
-    previous_stable_position: Optional[Position] = None
-    side_to_move: Optional[str] = INITIAL_SIDE_TO_MOVE
-
-    pending_signature: Optional[Tuple] = None
-    pending_count: int = 0
-    current_stable_signature: Optional[Tuple] = None
-
-    move_history: List[TrackedMove] = field(default_factory=list)
-    last_detected_move: Optional[TrackedMove] = None
-
-
+# =========================
 # Screen capture
+# =========================
 
 def capture_monitor(monitor_index: int) -> np.ndarray:
     with mss.mss() as sct:
@@ -131,7 +97,10 @@ def crop_region(image: np.ndarray, region: Region) -> np.ndarray:
     y2 = min(h, region.bottom)
     return image[y1:y2, x1:x2].copy()
 
+
+# =========================
 # Debug / saving helpers
+# =========================
 
 def ensure_save_dir() -> None:
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -153,7 +122,144 @@ def save_calibration_images(screen: np.ndarray, regions: Regions) -> None:
     cv2.imwrite(os.path.join(SAVE_DIR, f"{timestamp}_left_hand.png"), crop_region(screen, regions.left_hand))
     cv2.imwrite(os.path.join(SAVE_DIR, f"{timestamp}_right_hand.png"), crop_region(screen, regions.right_hand))
 
+
+def save_board_cells(board_img: np.ndarray, out_dir: str = CELL_SAVE_DIR) -> str:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    full_dir = os.path.join(out_dir, timestamp)
+    os.makedirs(full_dir, exist_ok=True)
+
+    cells = split_board_into_cells(board_img)
+    for r, row in enumerate(cells):
+        for c, cell in enumerate(row):
+            path = os.path.join(full_dir, f"cell_r{r}_c{c}.png")
+            cv2.imwrite(path, cell)
+
+    return full_dir
+
+
+def show_all_cells(board_img: np.ndarray) -> None:
+    cells = split_board_into_cells(board_img)
+    rows = [np.hstack(row) for row in cells]
+    grid = np.vstack(rows)
+    cv2.imshow("All Cells", grid)
+
+
+def shrink_region(region: Region, frac: float = BOARD_SHRINK_FRAC) -> Region:
+    if frac <= 0:
+        return region
+
+    dx = int(region.width * frac)
+    dy = int(region.height * frac)
+    new_w = max(1, region.width - 2 * dx)
+    new_h = max(1, region.height - 2 * dy)
+
+    return Region(
+        left=region.left + dx,
+        top=region.top + dy,
+        width=new_w,
+        height=new_h,
+    )
+
+
+# =========================
 # Detection
+# =========================
+
+def refine_board_region_from_grid(image: np.ndarray, rough: Region) -> Optional[Region]:
+    roi = crop_region(image, rough)
+    if roi.size == 0:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(blur, 50, 150)
+
+    min_len = int(min(rough.width, rough.height) * 0.5)
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180,
+        threshold=80,
+        minLineLength=max(20, min_len),
+        maxLineGap=10,
+    )
+
+    if lines is None:
+        return None
+
+    vertical_x: List[int] = []
+    horizontal_y: List[int] = []
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+
+        if dx < 8 and dy > rough.height * 0.4:
+            vertical_x.append((x1 + x2) // 2)
+        elif dy < 8 and dx > rough.width * 0.4:
+            horizontal_y.append((y1 + y2) // 2)
+
+    if len(vertical_x) < 6 or len(horizontal_y) < 6:
+        return None
+
+    vertical_x.sort()
+    horizontal_y.sort()
+
+    left = min(vertical_x)
+    right = max(vertical_x)
+    top = min(horizontal_y)
+    bottom = max(horizontal_y)
+
+    if right <= left or bottom <= top:
+        return None
+
+    pad_x = int((right - left) * 0.02)
+    pad_y = int((bottom - top) * 0.02)
+
+    left = max(0, left - pad_x)
+    right = min(roi.shape[1] - 1, right + pad_x)
+    top = max(0, top - pad_y)
+    bottom = min(roi.shape[0] - 1, bottom + pad_y)
+
+    width = right - left
+    height = bottom - top
+    side = max(width, height)
+
+    cx = (left + right) // 2
+    cy = (top + bottom) // 2
+
+    half = side // 2
+    new_left = cx - half
+    new_top = cy - half
+    new_right = new_left + side
+    new_bottom = new_top + side
+
+    if new_left < 0:
+        new_right -= new_left
+        new_left = 0
+    if new_top < 0:
+        new_bottom -= new_top
+        new_top = 0
+    if new_right > roi.shape[1]:
+        shift = new_right - roi.shape[1]
+        new_left -= shift
+        new_right = roi.shape[1]
+    if new_bottom > roi.shape[0]:
+        shift = new_bottom - roi.shape[0]
+        new_top -= shift
+        new_bottom = roi.shape[0]
+
+    new_left = max(0, new_left)
+    new_top = max(0, new_top)
+
+    return Region(
+        left=rough.left + new_left,
+        top=rough.top + new_top,
+        width=new_right - new_left,
+        height=new_bottom - new_top,
+    )
+
 
 def detect_shogi_board(image: np.ndarray) -> Optional[Region]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -200,12 +306,18 @@ def detect_shogi_board(image: np.ndarray) -> Optional[Region]:
     x, y, w, h = best_rect
     pad = int(min(w, h) * BOARD_PAD_RATIO)
 
-    return Region(
+    rough = Region(
         left=max(0, x - pad),
         top=max(0, y - pad),
         width=w + 2 * pad,
         height=h + 2 * pad,
     )
+
+    refined = refine_board_region_from_grid(image, rough)
+    board = refined if refined is not None else rough
+    board = shrink_region(board, BOARD_SHRINK_FRAC)
+
+    return board
 
 
 def manually_select_board(screen: np.ndarray) -> Optional[Region]:
@@ -217,7 +329,8 @@ def manually_select_board(screen: np.ndarray) -> Optional[Region]:
         return None
 
     side = int(min(w, h))
-    return Region(left=int(x), top=int(y), width=side, height=side)
+    board = Region(left=int(x), top=int(y), width=side, height=side)
+    return shrink_region(board, BOARD_SHRINK_FRAC)
 
 
 def derive_regions(image: np.ndarray, board: Region) -> Regions:
@@ -267,21 +380,110 @@ def detect_all_regions() -> Tuple[np.ndarray, Regions, int]:
 
     raise RuntimeError("Could not detect shogi board.")
 
+
+# =========================
+# Internal grid detection
+# =========================
+
+def detect_internal_grid_bounds(board_img: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Detect the 10 vertical and 10 horizontal board boundaries inside the already-cropped board.
+    Returns (xs, ys), each length 10.
+    """
+    gray = cv2.cvtColor(board_img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(blur, 50, 150)
+
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180,
+        threshold=60,
+        minLineLength=int(min(board_img.shape[:2]) * 0.5),
+        maxLineGap=8,
+    )
+
+    if lines is None:
+        return None
+
+    vertical: List[int] = []
+    horizontal: List[int] = []
+
+    h, w = board_img.shape[:2]
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+
+        if dx < 6 and dy > h * 0.5:
+            vertical.append((x1 + x2) // 2)
+        elif dy < 6 and dx > w * 0.5:
+            horizontal.append((y1 + y2) // 2)
+
+    if len(vertical) < 6 or len(horizontal) < 6:
+        return None
+
+    vertical = np.array(sorted(vertical))
+    horizontal = np.array(sorted(horizontal))
+
+    def cluster_lines(vals: np.ndarray, gap: int = 10) -> np.ndarray:
+        if len(vals) == 0:
+            return vals
+
+        groups = [[int(vals[0])]]
+        for v in vals[1:]:
+            if abs(int(v) - groups[-1][-1]) <= gap:
+                groups[-1].append(int(v))
+            else:
+                groups.append([int(v)])
+
+        return np.array([int(round(sum(g) / len(g))) for g in groups], dtype=int)
+
+    vx = cluster_lines(vertical, gap=10)
+    hy = cluster_lines(horizontal, gap=10)
+
+    if len(vx) < 2 or len(hy) < 2:
+        return None
+
+    left = int(vx[0])
+    right = int(vx[-1])
+    top = int(hy[0])
+    bottom = int(hy[-1])
+
+    if right <= left or bottom <= top:
+        return None
+
+    xs = np.linspace(left, right, 10).astype(int)
+    ys = np.linspace(top, bottom, 10).astype(int)
+
+    return xs, ys
+
+
+def get_board_grid_boundaries(board_img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    detected = detect_internal_grid_bounds(board_img)
+    if detected is not None:
+        return detected
+
+    h, w = board_img.shape[:2]
+    xs = np.linspace(0, w, 10).astype(int)
+    ys = np.linspace(0, h, 10).astype(int)
+    return xs, ys
+
+
+# =========================
 # Splitting helpers
+# =========================
 
 def split_board_into_cells(board_img: np.ndarray) -> List[List[np.ndarray]]:
-    h, w = board_img.shape[:2]
-    cell_h = h / 9.0
-    cell_w = w / 9.0
+    xs, ys = get_board_grid_boundaries(board_img)
 
     cells: List[List[np.ndarray]] = []
     for row in range(9):
         row_cells: List[np.ndarray] = []
         for col in range(9):
-            y1 = int(round(row * cell_h))
-            y2 = int(round((row + 1) * cell_h))
-            x1 = int(round(col * cell_w))
-            x2 = int(round((col + 1) * cell_w))
+            x1, x2 = xs[col], xs[col + 1]
+            y1, y2 = ys[row], ys[row + 1]
             row_cells.append(board_img[y1:y2, x1:x2].copy())
         cells.append(row_cells)
     return cells
@@ -298,7 +500,10 @@ def split_hand_into_slots(hand_img: np.ndarray, num_slots: int = HAND_SLOT_COUNT
         slots.append(hand_img[y1:y2, :].copy())
     return slots
 
+
+# =========================
 # Template loading
+# =========================
 
 def load_templates(template_root: str = TEMPLATE_ROOT) -> Dict[str, Dict[str, List[np.ndarray]]]:
     out: Dict[str, Dict[str, List[np.ndarray]]] = {"board": {}, "hand": {}}
@@ -315,7 +520,7 @@ def load_templates(template_root: str = TEMPLATE_ROOT) -> Dict[str, Dict[str, Li
 
             imgs: List[np.ndarray] = []
             for path in glob.glob(os.path.join(label_dir, "*")):
-                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                img = cv2.imread(path, cv2.IMREAD_COLOR)
                 if img is not None:
                     imgs.append(img)
 
@@ -339,7 +544,7 @@ def load_digit_templates(template_root: str = TEMPLATE_ROOT) -> Dict[str, List[n
 
         imgs: List[np.ndarray] = []
         for path in glob.glob(os.path.join(label_dir, "*")):
-            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            img = cv2.imread(path, cv2.IMREAD_COLOR)
             if img is not None:
                 imgs.append(img)
 
@@ -348,7 +553,10 @@ def load_digit_templates(template_root: str = TEMPLATE_ROOT) -> Dict[str, List[n
 
     return digit_templates
 
+
+# =========================
 # Preprocessing
+# =========================
 
 def normalize_img(img: np.ndarray) -> np.ndarray:
     return cv2.equalizeHist(img)
@@ -399,9 +607,15 @@ def preprocess_digit_img(img: np.ndarray, out_size: Tuple[int, int] = (24, 32)) 
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return cv2.resize(thresh, out_size, interpolation=cv2.INTER_AREA)
 
+
+# =========================
 # Template scoring
+# =========================
 
 def score_template(query: np.ndarray, tmpl: np.ndarray) -> float:
+    if len(tmpl.shape) == 3:
+        tmpl = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
+
     if query.shape != tmpl.shape:
         tmpl = cv2.resize(tmpl, (query.shape[1], query.shape[0]), interpolation=cv2.INTER_AREA)
 
@@ -442,7 +656,10 @@ def match_digit_templates(digit_img: np.ndarray, digit_templates: Dict[str, List
 
     return best_label, best_score
 
+
+# =========================
 # Promoted piece helpers
+# =========================
 
 def red_ratio(cell_img: np.ndarray) -> float:
     hsv = cv2.cvtColor(cell_img, cv2.COLOR_BGR2HSV)
@@ -477,7 +694,10 @@ def normalize_promoted_label(label: str, promoted_detected: bool) -> str:
 
     return label
 
+
+# =========================
 # Hand count badge reading
+# =========================
 
 def extract_count_badge(slot_img: np.ndarray) -> Optional[np.ndarray]:
     h, w = slot_img.shape[:2]
@@ -575,7 +795,10 @@ def read_badge_count(
     except ValueError:
         return fallback_hand_count(slot_img)
 
+
+# =========================
 # Recognition
+# =========================
 
 def classify_board_cell(
     cell_img: np.ndarray,
@@ -660,7 +883,10 @@ def classify_hand_slot(
         "score": round(score, 4),
     }
 
+
+# =========================
 # State extraction
+# =========================
 
 def extract_state(
     screen: np.ndarray,
@@ -690,7 +916,10 @@ def extract_state(
         "right_hand": right_hand_state,
     }
 
+
+# =========================
 # Visualization
+# =========================
 
 def draw_regions(image: np.ndarray, regions: Regions) -> np.ndarray:
     vis = image.copy()
@@ -721,10 +950,12 @@ def draw_board_grid(board_img: np.ndarray) -> np.ndarray:
     vis = board_img.copy()
     h, w = vis.shape[:2]
 
-    for i in range(1, 9):
-        x = int(round(i * w / 9.0))
-        y = int(round(i * h / 9.0))
+    xs, ys = get_board_grid_boundaries(board_img)
+
+    for x in xs:
         cv2.line(vis, (x, 0), (x, h), (0, 255, 0), 1)
+
+    for y in ys:
         cv2.line(vis, (0, y), (w, y), (0, 255, 0), 1)
 
     return vis
@@ -740,12 +971,15 @@ def draw_hand_slots(hand_img: np.ndarray, num_slots: int = HAND_SLOT_COUNT) -> n
 
     return vis
 
+
+# =========================
 # Printing helpers
+# =========================
 
 def print_state(state: Dict[str, object]) -> None:
     print("\n=== BOARD ===")
     for row in state["board"]:
-        print(" ".join(cell["label"] for cell in row))
+        print(" | ".join(f'{cell["label"]}:{cell["score"]:.2f}' for cell in row))
 
     print("\n=== LEFT HAND ===")
     for i, slot in enumerate(state["left_hand"], start=1):
@@ -756,196 +990,13 @@ def print_state(state: Dict[str, object]) -> None:
         print(f"slot {i}: {slot}")
 
 
-def print_move_history(tracker: TrackerState, max_items: int = 12) -> None:
-    print("\n=== MOVE HISTORY ===")
-    if not tracker.move_history:
-        print("(none)")
-        return
-
-    for item in tracker.move_history[-max_items:]:
-        move_no = (item.ply + 1) // 2
-        mover = "B" if item.side == BLACK else "W"
-        print(f"{move_no:>3}.{mover} {item.usi}  {item.explanation}")
-
-# Turn detection + move tracking helpers
-
-def normalize_hand_piece_label(label: str) -> Optional[str]:
-    if label in {"", ".", "empty", "blank", "unknown"}:
-        return None
-    return label.replace("+", "").upper()
-
-
-def capture_state_to_position(
-    capture_state: Dict[str, object],
-    side_to_move: Optional[str],
-    left_hand_owner: str = LEFT_HAND_OWNER,
-    right_hand_owner: str = RIGHT_HAND_OWNER,
-) -> Position:
-    pos = Position(side_to_move=side_to_move or INITIAL_SIDE_TO_MOVE)
-
-    for r in range(9):
-        for c in range(9):
-            label = capture_state["board"][r][c]["label"]
-            try:
-                pos.board[r][c] = parse_capture_label(label)
-            except Exception:
-                pos.board[r][c] = None
-
-    for slot in capture_state.get("left_hand", []):
-        piece = normalize_hand_piece_label(str(slot.get("piece", ".")))
-        count = int(slot.get("count", 0))
-        if piece and count > 0:
-            pos.hands[left_hand_owner][piece] += count
-
-    for slot in capture_state.get("right_hand", []):
-        piece = normalize_hand_piece_label(str(slot.get("piece", ".")))
-        count = int(slot.get("count", 0))
-        if piece and count > 0:
-            pos.hands[right_hand_owner][piece] += count
-
-    return pos
-
-
-def piece_signature(piece: Optional[Any]) -> Optional[Tuple[str, str, bool]]:
-    if piece is None:
-        return None
-    return (piece.kind, piece.owner, piece.promoted)
-
-
-def position_signature(position: Position) -> Tuple:
-    board_sig = tuple(
-        tuple(piece_signature(position.board[r][c]) for c in range(9))
-        for r in range(9)
-    )
-    hand_sig = (
-        tuple(sorted(position.hands[BLACK].items())),
-        tuple(sorted(position.hands[WHITE].items())),
-    )
-    return board_sig + hand_sig
-
-
-def positions_equivalent(a: Position, b: Position) -> bool:
-    return position_signature(a) == position_signature(b)
-
-
-def move_to_explanation(move: Move) -> str:
-    if move.drop:
-        return f"drop {move.piece} to {move.usi().split('*', 1)[1]}"
-    if move.promote:
-        return f"{move.usi()} (promotion)"
-    return move.usi()
-
-
-def infer_transition_move(
-    prev_position: Position,
-    curr_position: Position,
-    expected_side_to_move: Optional[str],
-) -> Tuple[Optional[str], Optional[Move]]:
-    candidate_sides = [expected_side_to_move] if expected_side_to_move else [BLACK, WHITE]
-
-    for side in candidate_sides:
-        if side is None:
-            continue
-        trial_prev = prev_position.clone()
-        trial_prev.side_to_move = side
-
-        for move in generate_legal_moves(trial_prev, side):
-            try:
-                nxt = apply_move(trial_prev, move)
-            except Exception:
-                continue
-            if positions_equivalent(nxt, curr_position):
-                return side, move
-
-    if expected_side_to_move is None:
-        return None, None
-
-    other_side = opponent(expected_side_to_move)
-    trial_prev = prev_position.clone()
-    trial_prev.side_to_move = other_side
-    for move in generate_legal_moves(trial_prev, other_side):
-        try:
-            nxt = apply_move(trial_prev, move)
-        except Exception:
-            continue
-        if positions_equivalent(nxt, curr_position):
-            return other_side, move
-
-    return None, None
-
-
-def update_tracker_from_capture_state(
-    tracker: TrackerState,
-    capture_state: Dict[str, object],
-) -> bool:
-    current_position = capture_state_to_position(
-        capture_state=capture_state,
-        side_to_move=tracker.side_to_move,
-        left_hand_owner=LEFT_HAND_OWNER,
-        right_hand_owner=RIGHT_HAND_OWNER,
-    )
-    current_sig = position_signature(current_position)
-
-    if tracker.pending_signature == current_sig:
-        tracker.pending_count += 1
-    else:
-        tracker.pending_signature = current_sig
-        tracker.pending_count = 1
-
-    if tracker.pending_count < STABLE_FRAMES_REQUIRED:
-        return False
-
-    if tracker.current_stable_signature == current_sig:
-        return False
-
-    tracker.current_stable_signature = current_sig
-
-    if tracker.previous_stable_position is None:
-        tracker.previous_stable_position = current_position
-        tracker.previous_stable_capture_state = capture_state
-        tracker.last_detected_move = None
-        return True
-
-    moved_side, detected_move = infer_transition_move(
-        prev_position=tracker.previous_stable_position,
-        curr_position=current_position,
-        expected_side_to_move=tracker.side_to_move,
-    )
-
-    if detected_move is not None and moved_side is not None:
-        tracked = TrackedMove(
-            ply=len(tracker.move_history) + 1,
-            side=moved_side,
-            usi=detected_move.usi(),
-            explanation=move_to_explanation(detected_move),
-        )
-        tracker.move_history.append(tracked)
-        tracker.last_detected_move = tracked
-        tracker.side_to_move = opponent(moved_side)
-    else:
-        # Fallback: keep synchronization even when the exact move could not
-        # be reconstructed, but do not invent a move history entry.
-        tracker.last_detected_move = None
-        if tracker.side_to_move is None:
-            tracker.side_to_move = INITIAL_SIDE_TO_MOVE
-
-    tracker.previous_stable_position = current_position
-    tracker.previous_stable_capture_state = capture_state
-    return True
-
-
-def side_label(side: Optional[str]) -> str:
-    if side == BLACK:
-        return "BLACK"
-    if side == WHITE:
-        return "WHITE"
-    return "UNKNOWN"
-
+# =========================
 # Main app loop
+# =========================
 
 def main() -> None:
     print("Starting shogi screen reader...")
-    print("Controls: q=quit, r=re-detect board, s=save crops")
+    print("Controls: q=quit, r=re-detect board, s=save crops, d=save 81 cells, a=show 81-cell grid")
     print(f"Switch to the shogi board window now... ({STARTUP_DELAY_SECONDS}s)")
     time.sleep(STARTUP_DELAY_SECONDS)
 
@@ -976,34 +1027,12 @@ def main() -> None:
     print("right_hand=", regions.right_hand.as_dict())
     print("monitor   =", active_monitor)
 
-    print("\nTracker configuration:")
-    print("  INITIAL_SIDE_TO_MOVE =", side_label(INITIAL_SIDE_TO_MOVE))
-    print("  LEFT_HAND_OWNER      =", side_label(LEFT_HAND_OWNER))
-    print("  RIGHT_HAND_OWNER     =", side_label(RIGHT_HAND_OWNER))
-    print("  STABLE_FRAMES_REQUIRED =", STABLE_FRAMES_REQUIRED)
-
-    tracker = TrackerState(side_to_move=INITIAL_SIDE_TO_MOVE)
-
     last_print = 0.0
     print_interval = 1.0
 
     while True:
         screen = capture_monitor(active_monitor)
         state = extract_state(screen, regions, templates, digit_templates)
-        became_stable = update_tracker_from_capture_state(tracker, state)
-
-        suggestion = None
-        try:
-            suggestion = suggest_move_from_capture_state(
-                capture_state=state,
-                side_to_move=tracker.side_to_move or INITIAL_SIDE_TO_MOVE,
-                depth=ENGINE_DEPTH,
-                left_hand_owner=LEFT_HAND_OWNER,
-                right_hand_owner=RIGHT_HAND_OWNER,
-            )
-        except Exception as exc:
-            suggestion = None
-            print(f"Engine error: {exc}")
 
         overlay = draw_regions(screen, regions)
 
@@ -1014,27 +1043,6 @@ def main() -> None:
         board_debug = draw_board_grid(board_img)
         left_hand_debug = draw_hand_slots(left_hand_img)
         right_hand_debug = draw_hand_slots(right_hand_img)
-
-        overlay_lines = [
-            f"Turn: {side_label(tracker.side_to_move)}",
-            f"Stable frames: {tracker.pending_count}/{STABLE_FRAMES_REQUIRED}",
-        ]
-        if tracker.last_detected_move is not None:
-            overlay_lines.append(f"Last move: {tracker.last_detected_move.usi}")
-        if suggestion:
-            overlay_lines.append(f"Best: {suggestion['move']}")
-
-        for idx, line in enumerate(overlay_lines):
-            cv2.putText(
-                overlay,
-                line,
-                (20, 35 + idx * 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
 
         if DEBUG_WINDOW_SCALE != 1.0:
             overlay = cv2.resize(
@@ -1053,28 +1061,6 @@ def main() -> None:
         now = time.time()
         if now - last_print >= print_interval:
             print_state(state)
-
-            print("\n=== TURN TRACKER ===")
-            print("side_to_move:", side_label(tracker.side_to_move))
-            if tracker.last_detected_move is not None:
-                print("last_detected_move:", tracker.last_detected_move.usi)
-            else:
-                print("last_detected_move: none")
-
-            if became_stable:
-                print("position_status: new stable position accepted")
-            else:
-                print("position_status: waiting / unchanged")
-
-            print_move_history(tracker)
-
-            print("\n=== ENGINE SUGGESTION ===")
-            if suggestion:
-                print("Move:", suggestion["move"])
-                print("Explanation:", suggestion["explanation"])
-            else:
-                print("No legal move found or engine failed.")
-
             last_print = now
 
         key = cv2.waitKey(1) & 0xFF
@@ -1089,14 +1075,17 @@ def main() -> None:
                 print("left_hand =", regions.left_hand.as_dict())
                 print("right_hand=", regions.right_hand.as_dict())
                 print("monitor   =", active_monitor)
-
-                tracker = TrackerState(side_to_move=INITIAL_SIDE_TO_MOVE)
-                print("Tracker reset after region re-detection.")
             except RuntimeError as exc:
                 print(f"Re-detection failed: {exc}")
         elif key == ord("s"):
             save_calibration_images(screen, regions)
             print(f"Saved debug images to ./{SAVE_DIR}/")
+        elif key == ord("d"):
+            saved_dir = save_board_cells(board_img)
+            print(f"Saved 81 board cells to ./{saved_dir}/")
+        elif key == ord("a"):
+            show_all_cells(board_img)
+            print("Showing 81-cell grid preview.")
 
     cv2.destroyAllWindows()
 
