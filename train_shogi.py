@@ -3,79 +3,64 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import random
+import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, random_split
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 
-
-class ShogiPolicyValueDataset(Dataset):
-    def __init__(self, path: str | Path):
-        self.path = Path(path)
-        self.examples: List[Tuple[torch.Tensor, int, float]] = []
-
-        with self.path.open("r", encoding="utf-8") as f:
-            for line_no, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-
-                x = torch.tensor(obj["input_planes"], dtype=torch.float32)
-                if x.ndim != 3 or x.shape[-2:] != (9, 9):
-                    raise ValueError(
-                        f"Line {line_no}: input_planes must have shape [C, 9, 9], got {tuple(x.shape)}"
-                    )
-
-                policy_target = int(obj["policy_target"])
-                value_target = float(obj.get("value_target", 0.0))
-                self.examples.append((x, policy_target, value_target))
-
-        if not self.examples:
-            raise ValueError("Dataset is empty.")
-
-        self.channels = self.examples[0][0].shape[0]
-
-    def __len__(self) -> int:
-        return len(self.examples)
-
-    def __getitem__(self, idx: int):
-        x, p, v = self.examples[idx]
-        return x, torch.tensor(p, dtype=torch.long), torch.tensor(v, dtype=torch.float32)
+from moveEncoding import TOTAL_MOVE_CLASSES
 
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-        )
-        self.relu = nn.ReLU(inplace=True)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.relu(x + self.net(x))
+        residual = x
+        x = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        x = self.bn2(self.conv2(x))
+        return F.relu(x + residual, inplace=True)
 
 
 class ShogiPolicyValueNet(nn.Module):
-    def __init__(self, in_channels: int, num_policy_classes: int, width: int = 128, blocks: int = 6):
-        super().__init__()
+    """
+    Compact AlphaZero-style network for 9x9 shogi positions.
 
-        trunk = [
+    Input shape:  [batch, 44, 9, 9]
+    Policy shape: [batch, TOTAL_MOVE_CLASSES]
+    Value shape:  [batch], in [-1, 1]
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 44,
+        num_policy_classes: int = TOTAL_MOVE_CLASSES,
+        width: int = 128,
+        blocks: int = 6,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_policy_classes = num_policy_classes
+        self.width = width
+        self.blocks = blocks
+
+        self.stem = nn.Sequential(
             nn.Conv2d(in_channels, width, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(width),
             nn.ReLU(inplace=True),
-        ]
-        for _ in range(blocks):
-            trunk.append(ResidualBlock(width))
-        self.trunk = nn.Sequential(*trunk)
+        )
+        self.trunk = nn.Sequential(*[ResidualBlock(width) for _ in range(blocks)])
 
-        # Policy head
         self.policy_head = nn.Sequential(
             nn.Conv2d(width, 32, kernel_size=1, bias=False),
             nn.BatchNorm2d(32),
@@ -84,170 +69,360 @@ class ShogiPolicyValueNet(nn.Module):
             nn.Linear(32 * 9 * 9, num_policy_classes),
         )
 
-        # Value head
         self.value_head = nn.Sequential(
-            nn.Conv2d(width, 32, kernel_size=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(width, 16, kernel_size=1, bias=False),
+            nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
             nn.Flatten(),
-            nn.Linear(32 * 9 * 9, 128),
+            nn.Linear(16 * 9 * 9, width),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 1),
+            nn.Linear(width, 1),
             nn.Tanh(),
         )
 
-    def forward(self, x: torch.Tensor):
-        z = self.trunk(x)
-        policy_logits = self.policy_head(z)
-        value = self.value_head(z).squeeze(-1)
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.trunk(self.stem(x))
+        policy_logits = self.policy_head(x)
+        value = self.value_head(x).squeeze(1)
         return policy_logits, value
 
 
-def accuracy_from_logits(logits: torch.Tensor, target: torch.Tensor) -> float:
-    pred = torch.argmax(logits, dim=1)
-    return (pred == target).float().mean().item()
+class ShardDataset(IterableDataset):
+    """
+    Streams converter.py .pt shards.
+
+    Each shard must contain:
+      input_planes:  [N, 44, 9, 9]
+      policy_target: [N]
+      value_target:  [N]
+    """
+
+    def __init__(self, shard_paths: Sequence[Path], shuffle_shards: bool = True, shuffle_in_shard: bool = True):
+        super().__init__()
+        self.shard_paths = [Path(p) for p in shard_paths]
+        self.shuffle_shards = shuffle_shards
+        self.shuffle_in_shard = shuffle_in_shard
+
+    def _worker_shards(self) -> List[Path]:
+        info = torch.utils.data.get_worker_info()
+        paths = list(self.shard_paths)
+        if info is None:
+            return paths
+        return paths[info.id::info.num_workers]
+
+    def __iter__(self):
+        paths = self._worker_shards()
+        if self.shuffle_shards:
+            random.shuffle(paths)
+
+        for shard_path in paths:
+            shard = torch.load(shard_path, map_location="cpu")
+            x = shard["input_planes"]
+            policy = shard["policy_target"]
+            value = shard["value_target"]
+
+            n = int(x.shape[0])
+            order = torch.randperm(n) if self.shuffle_in_shard else torch.arange(n)
+            for idx in order.tolist():
+                yield x[idx], policy[idx], value[idx]
 
 
-def run_epoch(
+def load_manifest_or_glob(data_dir: Path) -> Tuple[List[Path], Dict]:
+    manifest_path = data_dir / "manifest.json"
+    manifest: Dict = {}
+
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        shard_paths = [Path(p) for p in manifest.get("shards", [])]
+        shard_paths = [p if p.is_absolute() else data_dir / p for p in shard_paths]
+    else:
+        shard_paths = sorted(data_dir.glob("*.pt"))
+
+    shard_paths = [p for p in shard_paths if p.exists() and p.name != "checkpoint.pt"]
+    if not shard_paths:
+        raise ValueError(f"No .pt training shards found in {data_dir}")
+    return shard_paths, manifest
+
+
+def split_shards(shards: Sequence[Path], val_fraction: float, seed: int) -> Tuple[List[Path], List[Path]]:
+    shards = list(shards)
+    rng = random.Random(seed)
+    rng.shuffle(shards)
+    val_count = max(1, int(round(len(shards) * val_fraction))) if len(shards) > 1 else 0
+    return shards[val_count:], shards[:val_count]
+
+
+def estimate_examples(shards: Sequence[Path], manifest: Dict) -> Optional[int]:
+    if manifest.get("total_examples") and manifest.get("shards"):
+        frac = len(shards) / max(1, len(manifest["shards"]))
+        return int(manifest["total_examples"] * frac)
+    return None
+
+
+def make_loader(
+    shards: Sequence[Path],
+    batch_size: int,
+    workers: int,
+    shuffle: bool,
+    pin_memory: bool,
+) -> DataLoader:
+    ds = ShardDataset(shards, shuffle_shards=shuffle, shuffle_in_shard=shuffle)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        num_workers=workers,
+        pin_memory=pin_memory,
+        persistent_workers=workers > 0,
+    )
+
+
+def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
-    optimizer: torch.optim.Optimizer | None,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
     device: torch.device,
     value_loss_weight: float,
-):
-    training = optimizer is not None
-    model.train(training)
+    grad_clip: float,
+    log_every: int,
+    max_batches: Optional[int] = None,
+) -> Dict[str, float]:
+    model.train()
+    total_loss = total_policy = total_value = total_acc = 0.0
+    total_seen = 0
+    start = time.time()
 
-    ce_loss_fn = nn.CrossEntropyLoss()
-    mse_loss_fn = nn.MSELoss()
+    for batch_idx, (x, policy_target, value_target) in enumerate(loader, start=1):
+        x = x.to(device, non_blocking=True).float()
+        policy_target = policy_target.to(device, non_blocking=True).long()
+        value_target = value_target.to(device, non_blocking=True).float()
 
-    total_loss = 0.0
-    total_policy_loss = 0.0
-    total_value_loss = 0.0
-    total_acc = 0.0
-    total_count = 0
+        optimizer.zero_grad(set_to_none=True)
 
-    for x, policy_target, value_target in loader:
-        x = x.to(device)
-        policy_target = policy_target.to(device)
-        value_target = value_target.to(device)
+        with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+            policy_logits, value_pred = model(x)
+            policy_loss = F.cross_entropy(policy_logits, policy_target)
+            value_loss = F.mse_loss(value_pred, value_target)
+            loss = policy_loss + value_loss_weight * value_loss
 
-        if training:
-            optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        if grad_clip > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
 
-        policy_logits, value_pred = model(x)
-        policy_loss = ce_loss_fn(policy_logits, policy_target)
-        value_loss = mse_loss_fn(value_pred, value_target)
-        loss = policy_loss + value_loss_weight * value_loss
+        with torch.no_grad():
+            batch = x.shape[0]
+            acc = (policy_logits.argmax(dim=1) == policy_target).float().mean().item()
+            total_loss += loss.item() * batch
+            total_policy += policy_loss.item() * batch
+            total_value += value_loss.item() * batch
+            total_acc += acc * batch
+            total_seen += batch
 
-        if training:
-            loss.backward()
-            optimizer.step()
+        if log_every > 0 and batch_idx % log_every == 0:
+            elapsed = max(1e-6, time.time() - start)
+            print(
+                f"  batch={batch_idx} examples={total_seen} "
+                f"loss={total_loss / total_seen:.4f} "
+                f"policy={total_policy / total_seen:.4f} "
+                f"value={total_value / total_seen:.4f} "
+                f"acc={total_acc / total_seen:.4f} "
+                f"ex/s={total_seen / elapsed:.1f}"
+            )
 
-        batch_size = x.shape[0]
-        total_loss += loss.item() * batch_size
-        total_policy_loss += policy_loss.item() * batch_size
-        total_value_loss += value_loss.item() * batch_size
-        total_acc += accuracy_from_logits(policy_logits, policy_target) * batch_size
-        total_count += batch_size
+        if max_batches is not None and batch_idx >= max_batches:
+            break
 
     return {
-        "loss": total_loss / total_count,
-        "policy_loss": total_policy_loss / total_count,
-        "value_loss": total_value_loss / total_count,
-        "policy_acc": total_acc / total_count,
+        "loss": total_loss / max(1, total_seen),
+        "policy_loss": total_policy / max(1, total_seen),
+        "value_loss": total_value / max(1, total_seen),
+        "policy_acc": total_acc / max(1, total_seen),
+        "examples": float(total_seen),
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train a shogi policy-value network.")
-    parser.add_argument("--dataset", required=True, help="Path to JSONL dataset.")
-    parser.add_argument("--num-policy-classes", required=True, type=int, help="Size of move vocabulary.")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    value_loss_weight: float,
+    max_batches: Optional[int] = None,
+) -> Dict[str, float]:
+    model.eval()
+    total_loss = total_policy = total_value = total_acc = 0.0
+    total_seen = 0
+
+    for batch_idx, (x, policy_target, value_target) in enumerate(loader, start=1):
+        x = x.to(device, non_blocking=True).float()
+        policy_target = policy_target.to(device, non_blocking=True).long()
+        value_target = value_target.to(device, non_blocking=True).float()
+
+        policy_logits, value_pred = model(x)
+        policy_loss = F.cross_entropy(policy_logits, policy_target)
+        value_loss = F.mse_loss(value_pred, value_target)
+        loss = policy_loss + value_loss_weight * value_loss
+
+        batch = x.shape[0]
+        total_loss += loss.item() * batch
+        total_policy += policy_loss.item() * batch
+        total_value += value_loss.item() * batch
+        total_acc += (policy_logits.argmax(dim=1) == policy_target).float().mean().item() * batch
+        total_seen += batch
+
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+
+    return {
+        "loss": total_loss / max(1, total_seen),
+        "policy_loss": total_policy / max(1, total_seen),
+        "value_loss": total_value / max(1, total_seen),
+        "policy_acc": total_acc / max(1, total_seen),
+        "examples": float(total_seen),
+    }
+
+
+def save_checkpoint(
+    path: Path,
+    model: ShogiPolicyValueNet,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    args: argparse.Namespace,
+    best_val_loss: float,
+) -> None:
+    tmp = path.with_suffix(".tmp")
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_val_loss": best_val_loss,
+            "channels": model.in_channels,
+            "num_policy_classes": model.num_policy_classes,
+            "width": model.width,
+            "blocks": model.blocks,
+            "args": vars(args),
+        },
+        tmp,
+    )
+    os.replace(tmp, path)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train a policy-value shogi AI from converter.py PyTorch shards.")
+    parser.add_argument("--data", required=True, help="Directory containing train_*.pt shards and optional manifest.json")
+    parser.add_argument("--out", default="shogi_policy_value.pt")
+    parser.add_argument("--resume", default=None)
+
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--value-loss-weight", type=float, default=0.25)
+    parser.add_argument("--grad-clip", type=float, default=5.0)
+
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--blocks", type=int, default=6)
-    parser.add_argument("--train-split", type=float, default=0.9)
-    parser.add_argument("--value-loss-weight", type=float, default=0.2)
+    parser.add_argument("--channels", type=int, default=44)
+
+    parser.add_argument("--val-fraction", type=float, default=0.02)
+    parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--out", default="shogi_policy_value.pt")
+    parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--max-train-batches", type=int, default=None)
+    parser.add_argument("--max-val-batches", type=int, default=200)
     args = parser.parse_args()
 
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
-
-    dataset = ShogiPolicyValueDataset(args.dataset)
-    train_len = max(1, int(len(dataset) * args.train_split))
-    val_len = max(1, len(dataset) - train_len)
-    if train_len + val_len > len(dataset):
-        train_len = len(dataset) - val_len
-
-    train_ds, val_ds = random_split(dataset, [train_len, val_len])
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    torch.backends.cudnn.benchmark = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    data_dir = Path(args.data)
+    shard_paths, manifest = load_manifest_or_glob(data_dir)
+    train_shards, val_shards = split_shards(shard_paths, args.val_fraction, args.seed)
+
+    if not train_shards:
+        train_shards, val_shards = shard_paths, []
+
     model = ShogiPolicyValueNet(
-        in_channels=dataset.channels,
-        num_policy_classes=args.num_policy_classes,
+        in_channels=args.channels,
+        num_policy_classes=TOTAL_MOVE_CLASSES,
         width=args.width,
         blocks=args.blocks,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
 
-    best_val_acc = -math.inf
-    best_state = None
+    start_epoch = 1
+    best_val_loss = float("inf")
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        best_val_loss = float(ckpt.get("best_val_loss", best_val_loss))
+        print(f"Resumed from {args.resume} at epoch {start_epoch}")
+
+    pin_memory = device.type == "cuda"
+    train_loader = make_loader(train_shards, args.batch_size, args.workers, shuffle=True, pin_memory=pin_memory)
+    val_loader = make_loader(val_shards, args.batch_size, args.workers, shuffle=False, pin_memory=pin_memory) if val_shards else None
 
     print(f"Device: {device}")
-    print(f"Dataset size: {len(dataset)}")
-    print(f"Train: {len(train_ds)}  Val: {len(val_ds)}")
-    print(f"Channels: {dataset.channels}")
-    print(f"Policy classes: {args.num_policy_classes}")
+    print(f"Train shards: {len(train_shards)} | Val shards: {len(val_shards)}")
+    est_train = estimate_examples(train_shards, manifest)
+    if est_train is not None:
+        print(f"Approx. train examples: {est_train:,}")
+    print(f"Model: channels={args.channels}, width={args.width}, blocks={args.blocks}, policy_classes={TOTAL_MOVE_CLASSES}")
 
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(
+    out_path = Path(args.out)
+    best_path = out_path.with_name(out_path.stem + "_best" + out_path.suffix)
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        print(f"\nEpoch {epoch}/{args.epochs}")
+        train_metrics = train_one_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
+            scaler=scaler,
             device=device,
             value_loss_weight=args.value_loss_weight,
+            grad_clip=args.grad_clip,
+            log_every=args.log_every,
+            max_batches=args.max_train_batches,
         )
-        val_metrics = run_epoch(
-            model=model,
-            loader=val_loader,
-            optimizer=None,
-            device=device,
-            value_loss_weight=args.value_loss_weight,
-        )
+
+        if val_loader is not None:
+            val_metrics = evaluate(
+                model=model,
+                loader=val_loader,
+                device=device,
+                value_loss_weight=args.value_loss_weight,
+                max_batches=args.max_val_batches,
+            )
+        else:
+            val_metrics = {"loss": train_metrics["loss"], "policy_loss": 0.0, "value_loss": 0.0, "policy_acc": 0.0, "examples": 0.0}
 
         print(
-            f"Epoch {epoch:03d} | "
-            f"train loss={train_metrics['loss']:.4f} acc={train_metrics['policy_acc']:.4f} | "
-            f"val loss={val_metrics['loss']:.4f} acc={val_metrics['policy_acc']:.4f}"
+            f"Epoch {epoch:03d} complete | "
+            f"train loss={train_metrics['loss']:.4f} policy={train_metrics['policy_loss']:.4f} "
+            f"value={train_metrics['value_loss']:.4f} acc={train_metrics['policy_acc']:.4f} | "
+            f"val loss={val_metrics['loss']:.4f} policy={val_metrics['policy_loss']:.4f} "
+            f"value={val_metrics['value_loss']:.4f} acc={val_metrics['policy_acc']:.4f}"
         )
 
-        if val_metrics["policy_acc"] > best_val_acc:
-            best_val_acc = val_metrics["policy_acc"]
-            best_state = {
-                "model_state_dict": model.state_dict(),
-                "channels": dataset.channels,
-                "num_policy_classes": args.num_policy_classes,
-                "width": args.width,
-                "blocks": args.blocks,
-            }
+        save_checkpoint(out_path, model, optimizer, epoch, args, best_val_loss)
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            save_checkpoint(best_path, model, optimizer, epoch, args, best_val_loss)
+            print(f"Saved new best checkpoint: {best_path}")
 
-    if best_state is None:
-        raise RuntimeError("Training ended without a saved model.")
-
-    torch.save(best_state, args.out)
-    print(f"Saved best model to {args.out}")
+    print(f"Saved final checkpoint: {out_path}")
 
 
 if __name__ == "__main__":
