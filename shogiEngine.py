@@ -292,12 +292,22 @@ def apply_move(position: Position, move: Move) -> Position:
         if moving_piece is None:
             raise ValueError("No piece on source square.")
 
+        if moving_piece.owner != side:
+            raise ValueError(f"Moving opponent piece: {move}")
+
         target = new_pos.piece_at(move.to_sq)
         if target is not None:
+            if target.owner == side:
+                raise ValueError("Cannot capture own piece.")
+
             captured_base = target.kind
-            new_pos.hands[side][captured_base] += 1
+
+            # Kings are never added to hand.
+            if captured_base != "K":
+                new_pos.hands[side][captured_base] += 1
 
         new_pos.set_piece(move.from_sq, None)
+
         new_piece = Piece(
             kind=moving_piece.kind,
             owner=side,
@@ -307,7 +317,6 @@ def apply_move(position: Position, move: Move) -> Position:
 
     new_pos.side_to_move = opponent(side)
     return new_pos
-
 
 def attacked_by(position: Position, attacker_side: str, square: Tuple[int, int]) -> bool:
     for move in generate_pseudo_legal_moves_no_drops(position, attacker_side):
