@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import threading # Added for GUI
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -8,6 +9,7 @@ import cv2
 import torch
 
 import ScreenCapture as sc
+from ShogiUI import ShogiControlGUI # Added UI Import
 from converter import encode_position
 from moveEncoding import TOTAL_MOVE_CLASSES, encode_move_obj
 from shogiEngine import (
@@ -27,6 +29,14 @@ from train_shogi import ShogiPolicyValueNet
 
 MODEL_MODE = "model"
 BASIC_MODE = "basic"
+
+# --- GUI BRIDGE ---
+remote_key = -1
+gui_instance = None # Added to allow main() to find the window
+
+def handle_gui_button(key_char):
+    global remote_key
+    remote_key = ord(key_char)
 
 
 def parse_side(value: str) -> str:
@@ -130,6 +140,7 @@ def load_neural_if_needed(mode: str, model_path: Optional[str]) -> Optional[Neur
 
 
 def main() -> None:
+    global remote_key, gui_instance
     parser = argparse.ArgumentParser(
         description="Run the shogi screen reader and optionally suggest moves with a trained AI model or the basic engine."
     )
@@ -190,6 +201,9 @@ def main() -> None:
                             f"| legal-policy={suggestion['legal_policy_prob']:.3f} "
                             f"| value={suggestion['value']:.3f}"
                         )
+                        # UPDATE GUI
+                        if gui_instance:
+                            gui_instance.update_display(args.side, suggestion['move'], suggestion['explanation'], suggestion['value'], suggestion['legal_policy_prob'])
                 else:
                     suggestion = suggest_move_from_capture_state(
                         state,
@@ -200,6 +214,9 @@ def main() -> None:
                         print(f"\n[{mode}] No legal move found for {args.side}.")
                     else:
                         print(f"\n[{mode}] {args.side} to move: {suggestion['move']} | {suggestion['explanation']}")
+                        # UPDATE GUI
+                        if gui_instance:
+                            gui_instance.update_display(args.side, suggestion['move'], suggestion['explanation'])
             except Exception as exc:
                 print(f"\nCould not produce suggestion: {exc}")
 
@@ -216,7 +233,13 @@ def main() -> None:
             cv2.imshow("Shogi Capture - Left Hand", sc.draw_hand_slots(left_hand_img))
             cv2.imshow("Shogi Capture - Right Hand", sc.draw_hand_slots(right_hand_img))
 
-        key = cv2.waitKey(1) & 0xFF
+        # Handle Inputs (GUI or Keyboard)
+        if remote_key != -1:
+            key = remote_key
+            remote_key = -1
+        else:
+            key = cv2.waitKey(1) & 0xFF
+
         if key == ord("q"):
             break
         if key == ord("h"):
@@ -234,6 +257,8 @@ def main() -> None:
             args.side = opponent(args.side)
             ply += 1
             print(f"Side to move: {args.side}")
+            if gui_instance:
+                gui_instance.update_display(args.side, "--", "Side toggled.")
         elif key == ord("r"):
             screen, regions, active_monitor = sc.detect_all_regions()
             print("\nRe-detected regions:")
@@ -257,4 +282,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # START MAIN IN A THREAD, START GUI ON THE MAIN LINE
+    gui_instance = ShogiControlGUI(handle_gui_button)
+    threading.Thread(target=main, daemon=True).start()
+    gui_instance.mainloop()
