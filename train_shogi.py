@@ -2,17 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import random
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, IterableDataset
+from torch.utils.data import DataLoader, IterableDataset
 
 from moveEncoding import TOTAL_MOVE_CLASSES
 
@@ -59,7 +58,10 @@ class ShogiPolicyValueNet(nn.Module):
             nn.BatchNorm2d(width),
             nn.ReLU(inplace=True),
         )
-        self.trunk = nn.Sequential(*[ResidualBlock(width) for _ in range(blocks)])
+
+        self.trunk = nn.Sequential(
+            *[ResidualBlock(width) for _ in range(blocks)]
+        )
 
         self.policy_head = nn.Sequential(
             nn.Conv2d(width, 32, kernel_size=1, bias=False),
@@ -97,7 +99,12 @@ class ShardDataset(IterableDataset):
       value_target:  [N]
     """
 
-    def __init__(self, shard_paths: Sequence[Path], shuffle_shards: bool = True, shuffle_in_shard: bool = True):
+    def __init__(
+        self,
+        shard_paths: Sequence[Path],
+        shuffle_shards: bool = True,
+        shuffle_in_shard: bool = True,
+    ):
         super().__init__()
         self.shard_paths = [Path(p) for p in shard_paths]
         self.shuffle_shards = shuffle_shards
@@ -106,23 +113,28 @@ class ShardDataset(IterableDataset):
     def _worker_shards(self) -> List[Path]:
         info = torch.utils.data.get_worker_info()
         paths = list(self.shard_paths)
+
         if info is None:
             return paths
+
         return paths[info.id::info.num_workers]
 
     def __iter__(self):
         paths = self._worker_shards()
+
         if self.shuffle_shards:
             random.shuffle(paths)
 
         for shard_path in paths:
             shard = torch.load(shard_path, map_location="cpu")
+
             x = shard["input_planes"]
             policy = shard["policy_target"]
             value = shard["value_target"]
 
             n = int(x.shape[0])
             order = torch.randperm(n) if self.shuffle_in_shard else torch.arange(n)
+
             for idx in order.tolist():
                 yield x[idx], policy[idx], value[idx]
 
@@ -138,17 +150,28 @@ def load_manifest_or_glob(data_dir: Path) -> Tuple[List[Path], Dict]:
     else:
         shard_paths = sorted(data_dir.glob("*.pt"))
 
-    shard_paths = [p for p in shard_paths if p.exists() and p.name != "checkpoint.pt"]
+    shard_paths = [
+        p for p in shard_paths
+        if p.exists() and p.name != "checkpoint.pt"
+    ]
+
     if not shard_paths:
         raise ValueError(f"No .pt training shards found in {data_dir}")
+
     return shard_paths, manifest
 
 
-def split_shards(shards: Sequence[Path], val_fraction: float, seed: int) -> Tuple[List[Path], List[Path]]:
+def split_shards(
+    shards: Sequence[Path],
+    val_fraction: float,
+    seed: int,
+) -> Tuple[List[Path], List[Path]]:
     shards = list(shards)
     rng = random.Random(seed)
     rng.shuffle(shards)
+
     val_count = max(1, int(round(len(shards) * val_fraction))) if len(shards) > 1 else 0
+
     return shards[val_count:], shards[:val_count]
 
 
@@ -156,6 +179,7 @@ def estimate_examples(shards: Sequence[Path], manifest: Dict) -> Optional[int]:
     if manifest.get("total_examples") and manifest.get("shards"):
         frac = len(shards) / max(1, len(manifest["shards"]))
         return int(manifest["total_examples"] * frac)
+
     return None
 
 
@@ -166,7 +190,12 @@ def make_loader(
     shuffle: bool,
     pin_memory: bool,
 ) -> DataLoader:
-    ds = ShardDataset(shards, shuffle_shards=shuffle, shuffle_in_shard=shuffle)
+    ds = ShardDataset(
+        shards,
+        shuffle_shards=shuffle,
+        shuffle_in_shard=shuffle,
+    )
+
     return DataLoader(
         ds,
         batch_size=batch_size,
@@ -188,8 +217,13 @@ def train_one_epoch(
     max_batches: Optional[int] = None,
 ) -> Dict[str, float]:
     model.train()
-    total_loss = total_policy = total_value = total_acc = 0.0
+
+    total_loss = 0.0
+    total_policy = 0.0
+    total_value = 0.0
+    total_acc = 0.0
     total_seen = 0
+
     start = time.time()
 
     for batch_idx, (x, policy_target, value_target) in enumerate(loader, start=1):
@@ -201,20 +235,24 @@ def train_one_epoch(
 
         with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
             policy_logits, value_pred = model(x)
+
             policy_loss = F.cross_entropy(policy_logits, policy_target)
             value_loss = F.mse_loss(value_pred, value_target)
             loss = policy_loss + value_loss_weight * value_loss
 
         scaler.scale(loss).backward()
+
         if grad_clip > 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
         scaler.step(optimizer)
         scaler.update()
 
         with torch.no_grad():
             batch = x.shape[0]
             acc = (policy_logits.argmax(dim=1) == policy_target).float().mean().item()
+
             total_loss += loss.item() * batch
             total_policy += policy_loss.item() * batch
             total_value += value_loss.item() * batch
@@ -253,7 +291,11 @@ def evaluate(
     max_batches: Optional[int] = None,
 ) -> Dict[str, float]:
     model.eval()
-    total_loss = total_policy = total_value = total_acc = 0.0
+
+    total_loss = 0.0
+    total_policy = 0.0
+    total_value = 0.0
+    total_acc = 0.0
     total_seen = 0
 
     for batch_idx, (x, policy_target, value_target) in enumerate(loader, start=1):
@@ -262,15 +304,23 @@ def evaluate(
         value_target = value_target.to(device, non_blocking=True).float()
 
         policy_logits, value_pred = model(x)
+
         policy_loss = F.cross_entropy(policy_logits, policy_target)
         value_loss = F.mse_loss(value_pred, value_target)
         loss = policy_loss + value_loss_weight * value_loss
 
         batch = x.shape[0]
+
         total_loss += loss.item() * batch
         total_policy += policy_loss.item() * batch
         total_value += value_loss.item() * batch
-        total_acc += (policy_logits.argmax(dim=1) == policy_target).float().mean().item() * batch
+        total_acc += (
+            (policy_logits.argmax(dim=1) == policy_target)
+            .float()
+            .mean()
+            .item()
+            * batch
+        )
         total_seen += batch
 
         if max_batches is not None and batch_idx >= max_batches:
@@ -294,6 +344,7 @@ def save_checkpoint(
     best_val_loss: float,
 ) -> None:
     tmp = path.with_suffix(".tmp")
+
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -308,14 +359,29 @@ def save_checkpoint(
         },
         tmp,
     )
+
     os.replace(tmp, path)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train a policy-value shogi AI from converter.py PyTorch shards.")
-    parser.add_argument("--data", required=True, help="Directory containing train_*.pt shards and optional manifest.json")
+    parser = argparse.ArgumentParser(
+        description="Train a policy-value shogi AI from converter.py PyTorch shards."
+    )
+
+    parser.add_argument(
+        "--data",
+        required=True,
+        help="Directory containing train_*.pt shards and optional manifest.json",
+    )
+
     parser.add_argument("--out", default="shogi_policy_value.pt")
     parser.add_argument("--resume", default=None)
+
+    parser.add_argument(
+        "--reset-optimizer",
+        action="store_true",
+        help="Load model weights from --resume but initialize a fresh optimizer.",
+    )
 
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=512)
@@ -334,6 +400,21 @@ def main() -> None:
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-val-batches", type=int, default=200)
+
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=2,
+        help="Stop after this many epochs without meaningful validation-loss improvement. Use 0 to disable.",
+    )
+
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.001,
+        help="Minimum validation-loss improvement required to reset early-stopping patience.",
+    )
+
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -341,9 +422,15 @@ def main() -> None:
     torch.backends.cudnn.benchmark = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     data_dir = Path(args.data)
     shard_paths, manifest = load_manifest_or_glob(data_dir)
-    train_shards, val_shards = split_shards(shard_paths, args.val_fraction, args.seed)
+
+    train_shards, val_shards = split_shards(
+        shard_paths,
+        args.val_fraction,
+        args.seed,
+    )
 
     if not train_shards:
         train_shards, val_shards = shard_paths, []
@@ -355,36 +442,80 @@ def main() -> None:
         blocks=args.blocks,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
     scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
 
     start_epoch = 1
     best_val_loss = float("inf")
+
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
+
         model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        best_val_loss = float(ckpt.get("best_val_loss", best_val_loss))
-        print(f"Resumed from {args.resume} at epoch {start_epoch}")
+
+        if args.reset_optimizer:
+            start_epoch = 1
+            best_val_loss = float("inf")
+            print("Loaded model weights only.")
+            print("Initialized fresh optimizer for fine-tuning.")
+        else:
+            if "optimizer_state_dict" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                print("Loaded optimizer state.")
+
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            best_val_loss = float(ckpt.get("best_val_loss", best_val_loss))
+
+        print(f"Loaded checkpoint: {args.resume}")
+        print(f"Starting at epoch {start_epoch}")
 
     pin_memory = device.type == "cuda"
-    train_loader = make_loader(train_shards, args.batch_size, args.workers, shuffle=True, pin_memory=pin_memory)
-    val_loader = make_loader(val_shards, args.batch_size, args.workers, shuffle=False, pin_memory=pin_memory) if val_shards else None
+
+    train_loader = make_loader(
+        train_shards,
+        args.batch_size,
+        args.workers,
+        shuffle=True,
+        pin_memory=pin_memory,
+    )
+
+    val_loader = (
+        make_loader(
+            val_shards,
+            args.batch_size,
+            args.workers,
+            shuffle=False,
+            pin_memory=pin_memory,
+        )
+        if val_shards
+        else None
+    )
 
     print(f"Device: {device}")
     print(f"Train shards: {len(train_shards)} | Val shards: {len(val_shards)}")
+
     est_train = estimate_examples(train_shards, manifest)
     if est_train is not None:
         print(f"Approx. train examples: {est_train:,}")
-    print(f"Model: channels={args.channels}, width={args.width}, blocks={args.blocks}, policy_classes={TOTAL_MOVE_CLASSES}")
+
+    print(
+        f"Model: channels={args.channels}, width={args.width}, "
+        f"blocks={args.blocks}, policy_classes={TOTAL_MOVE_CLASSES}"
+    )
 
     out_path = Path(args.out)
     best_path = out_path.with_name(out_path.stem + "_best" + out_path.suffix)
 
+    epochs_without_improvement = 0
+
     for epoch in range(start_epoch, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
+
         train_metrics = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -406,21 +537,66 @@ def main() -> None:
                 max_batches=args.max_val_batches,
             )
         else:
-            val_metrics = {"loss": train_metrics["loss"], "policy_loss": 0.0, "value_loss": 0.0, "policy_acc": 0.0, "examples": 0.0}
+            val_metrics = {
+                "loss": train_metrics["loss"],
+                "policy_loss": 0.0,
+                "value_loss": 0.0,
+                "policy_acc": 0.0,
+                "examples": 0.0,
+            }
 
         print(
             f"Epoch {epoch:03d} complete | "
-            f"train loss={train_metrics['loss']:.4f} policy={train_metrics['policy_loss']:.4f} "
-            f"value={train_metrics['value_loss']:.4f} acc={train_metrics['policy_acc']:.4f} | "
-            f"val loss={val_metrics['loss']:.4f} policy={val_metrics['policy_loss']:.4f} "
-            f"value={val_metrics['value_loss']:.4f} acc={val_metrics['policy_acc']:.4f}"
+            f"train loss={train_metrics['loss']:.4f} "
+            f"policy={train_metrics['policy_loss']:.4f} "
+            f"value={train_metrics['value_loss']:.4f} "
+            f"acc={train_metrics['policy_acc']:.4f} | "
+            f"val loss={val_metrics['loss']:.4f} "
+            f"policy={val_metrics['policy_loss']:.4f} "
+            f"value={val_metrics['value_loss']:.4f} "
+            f"acc={val_metrics['policy_acc']:.4f}"
         )
 
-        save_checkpoint(out_path, model, optimizer, epoch, args, best_val_loss)
-        if val_metrics["loss"] < best_val_loss:
+        save_checkpoint(
+            out_path,
+            model,
+            optimizer,
+            epoch,
+            args,
+            best_val_loss,
+        )
+
+        improved = val_metrics["loss"] < best_val_loss - args.early_stop_min_delta
+
+        if improved:
             best_val_loss = val_metrics["loss"]
-            save_checkpoint(best_path, model, optimizer, epoch, args, best_val_loss)
+            epochs_without_improvement = 0
+
+            save_checkpoint(
+                best_path,
+                model,
+                optimizer,
+                epoch,
+                args,
+                best_val_loss,
+            )
+
             print(f"Saved new best checkpoint: {best_path}")
+
+        else:
+            epochs_without_improvement += 1
+
+            print(
+                f"No meaningful validation improvement "
+                f"({epochs_without_improvement}/{args.early_stop_patience})"
+            )
+
+            if (
+                args.early_stop_patience > 0
+                and epochs_without_improvement >= args.early_stop_patience
+            ):
+                print("Early stopping: validation loss stopped improving.")
+                break
 
     print(f"Saved final checkpoint: {out_path}")
 
