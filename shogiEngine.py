@@ -521,30 +521,100 @@ def move_ordering_bonus(position: Position, move: Move, side: str) -> int:
 
 #Capture-state integration 
 
-def parse_capture_label(label: str) -> Optional[Piece]:
+CAPTURE_EMPTY_LABELS = {"empty", ".", "blank", "unknown", ""}
+CAPTURE_PIECE_KINDS = {"P", "L", "N", "S", "G", "B", "R", "K"}
+HAND_PIECE_KINDS = {"P", "L", "N", "S", "G", "B", "R"}
+
+
+def _split_capture_side_and_piece(label: str) -> Tuple[Optional[str], str, bool]:
     """
-    Expected labels from the screen reader:
-      black_P, white_P, black_+P, white_+P, ...
-      or bP / wP / b+P / w+P
-    Empty / unknown labels return None.
+    Accepts labels such as:
+      goteL, senteP, gote+P, sente+R
+      black_P, white_P, black_+P, white_+P
+      bP, wP, b+P, w+P
+
+    Returns:
+      owner, piece_text, promoted
     """
-    if label in {"empty", ".", "blank", "unknown", ""}:
+    raw = str(label).strip()
+    compact = raw.replace(" ", "").replace("-", "_")
+    lower = compact.lower()
+
+    promoted = "+" in compact or "promoted" in lower
+
+    prefixes = [
+        ("sente", BLACK),
+        ("black", BLACK),
+        ("gote", WHITE),
+        ("white", WHITE),
+        ("b", BLACK),
+        ("w", WHITE),
+    ]
+
+    for prefix, owner in prefixes:
+        if lower.startswith(prefix):
+            rest = compact[len(prefix):]
+            return owner, rest, promoted
+
+    return None, compact, promoted
+
+
+def _clean_piece_kind(piece_text: str) -> str:
+    kind = (
+        piece_text
+        .replace("_", "")
+        .replace("+", "")
+        .replace("promoted", "")
+        .replace("PROMOTED", "")
+        .strip()
+        .upper()
+    )
+
+    if kind in CAPTURE_PIECE_KINDS:
+        return kind
+
+    raise ValueError(f"Unsupported capture piece kind: {piece_text}")
+
+
+def parse_hand_piece_kind(label: str) -> Optional[str]:
+    """
+    Converts hand-slot labels into engine piece kinds.
+    Accepts both plain piece labels, such as P/L/N/S/G/B/R,
+    and side-prefixed labels, such as senteP or goteL.
+    """
+    if label in CAPTURE_EMPTY_LABELS:
         return None
 
-    promoted = "+" in label
-    cleaned = label.replace("+", "")
+    _, piece_text, _ = _split_capture_side_and_piece(label)
+    kind = _clean_piece_kind(piece_text)
 
-    if "_" in cleaned:
-        side_str, kind = cleaned.split("_", 1)
-        owner = BLACK if side_str.lower().startswith(("b", "black", "sente")) else WHITE
-        return Piece(kind=kind.upper(), owner=owner, promoted=promoted)
+    if kind not in HAND_PIECE_KINDS:
+        return None
 
-    if len(cleaned) >= 2 and cleaned[0].lower() in {"b", "w"}:
-        owner = BLACK if cleaned[0].lower() == "b" else WHITE
-        kind = cleaned[1:].upper()
-        return Piece(kind=kind, owner=owner, promoted=promoted)
+    return kind
 
-    raise ValueError(f"Unsupported capture label format: {label}")
+def parse_capture_label(label: str) -> Optional[Piece]:
+    """
+    Converts screen-reader board labels into engine Piece objects.
+
+    Supported examples:
+      goteL, senteP, gote+P, sente+R
+      black_P, white_P, black_+P, white_+P
+      bP, wP, b+P, w+P
+
+    Empty / unknown labels return None.
+    """
+    if label in CAPTURE_EMPTY_LABELS:
+        return None
+
+    owner, piece_text, promoted = _split_capture_side_and_piece(label)
+
+    if owner is None:
+        raise ValueError(f"Unsupported capture label format: {label}")
+
+    kind = _clean_piece_kind(piece_text)
+
+    return Piece(kind=kind, owner=owner, promoted=promoted)
 
 
 def position_from_capture_state(
@@ -567,18 +637,19 @@ def position_from_capture_state(
             cell = board_rows[r][c]
             piece = parse_capture_label(cell["label"])
             pos.board[r][c] = piece
-
     for slot in capture_state.get("left_hand", []):
         piece = slot.get("piece", ".")
         count = int(slot.get("count", 0))
-        if piece not in {".", "empty", "blank", "unknown"} and count > 0:
-            pos.hands[left_hand_owner][piece.replace("+", "").upper()] += count
+        kind = parse_hand_piece_kind(piece)
+        if kind is not None and count > 0:
+            pos.hands[left_hand_owner][kind] += count
 
     for slot in capture_state.get("right_hand", []):
         piece = slot.get("piece", ".")
         count = int(slot.get("count", 0))
-        if piece not in {".", "empty", "blank", "unknown"} and count > 0:
-            pos.hands[right_hand_owner][piece.replace("+", "").upper()] += count
+        kind = parse_hand_piece_kind(piece)
+        if kind is not None and count > 0:
+            pos.hands[right_hand_owner][kind] += count
 
     return pos
 
