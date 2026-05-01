@@ -4,3 +4,4 @@ games/
 .venv/
 .venv-rocm/
 __pycache__/
+.pt
