@@ -1,0 +1,7 @@
+games/
+*.txt
+*.kif
+.venv/
+.venv-rocm/
+__pycache__/
+.pt
