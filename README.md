@@ -24,3 +24,12 @@ MCTS (Monte Carlo Tree Search): Used in selfPlayTrain.py to explore the game tre
 Reinforcement Learning: The agent plays against versions of itself, using the scrubbed league data as a baseline to avoid "random" early-stage play.
 
 Move Encoding: High-efficiency conversion of board states into tensors via moveEncoding.py to maximize training throughput.
+
+## Running the Code ##
+To have the project run, the CNN classifiers will need to be trained on images taken from the screen recorder. 
+To start got to https://lishogi.org/editor. Once there, launch the screen_capture.py file
+Next, fill the board up with on kind of piece and then click on the debugging menu and press d. Do this for all piece types, an empty board, and the side hands. 
+Once the images are collected, move them into the correct template folder and run the CNNs
+
+Next, download https://drive.google.com/file/d/1QpnprcMNT2RTVUrNOsrzDrU_Mi7Snesp/view?usp=drive_link. This is the fully trained model.
+Now you can run launcher.py, and you'll have a working shoji engine. 
